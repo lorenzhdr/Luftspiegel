@@ -5,7 +5,7 @@
   "main": "main.js",
   "private": true,
   "author": "Lorenz",
-  "license": "GPL-3.0",
+  "license": "LGPL-3.0-or-later",
   "scripts": {
     "start": "electron .",
     "build": "electron-builder --win --arm64"
@@ -34,10 +34,6 @@
       {
         "from": "../bin/ffmpeg.exe",
         "to": "ffmpeg.exe"
-      },
-      {
-        "from": "../bin/ffprobe.exe",
-        "to": "ffprobe.exe"
       }
     ],
     "win": {

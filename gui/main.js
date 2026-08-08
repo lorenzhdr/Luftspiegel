@@ -360,18 +360,25 @@ function writeAudioChunk(buffer) {
 // ---------------------------------------------------------------------------
 
 function resolveSidecarPath() {
-  const exeName = 'luftspiegel.exe';
-  const candidate = app.isPackaged
-    ? path.join(process.resourcesPath, exeName)
-    : path.join(__dirname, '..', 'bin', exeName);
+  // Der Installer legt die Binary als luftspiegel.exe ab, das Makefile des
+  // Upstream-Projekts baut sie dagegen als doubletake.exe. Beide Namen werden
+  // akzeptiert, damit ein frischer Klon nach einem simplen `make` sofort
+  // funktioniert und nicht an einer Umbenennung scheitert.
+  const exeNames = ['luftspiegel.exe', 'doubletake.exe'];
+  const dir = app.isPackaged
+    ? process.resourcesPath
+    : path.join(__dirname, '..', 'bin');
 
-  if (!fs.existsSync(candidate)) {
+  const candidates = exeNames.map((n) => path.join(dir, n));
+  const found = candidates.find((c) => fs.existsSync(c));
+
+  if (!found) {
     throw new Error(
-      `Sidecar-Programm nicht gefunden: ${candidate}\n` +
-        'Bitte sicherstellen, dass luftspiegel.exe im bin-Ordner liegt.'
+      `Sidecar-Programm nicht gefunden. Gesucht in:\n${candidates.join('\n')}\n` +
+        'Mit `go build -o bin/luftspiegel.exe ./cmd/doubletake` bauen (oder `make`).'
     );
   }
-  return candidate;
+  return found;
 }
 
 function buildSidecarArgs(s) {

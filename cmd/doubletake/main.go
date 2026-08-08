@@ -72,7 +72,7 @@ func main() {
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
-	audioTCPPort := flag.Int("audio-tcp", airplay.DefaultAudioTCPPort, "Windows only: local TCP port (127.0.0.1) that the audio-source GUI connects to, pushing raw PCM (s16le, 48000 Hz, stereo, no header); ignored on Linux. Ignored entirely if -no-audio is set.")
+	audioTCPPort := flag.Int("audio-tcp", airplay.DefaultAudioTCPPort, "Windows only: local TCP port (127.0.0.1) that the audio-source GUI connects to, pushing raw PCM (s16le, 44100 Hz, stereo, no header); ignored on Linux. Ignored entirely if -no-audio is set.")
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with a control interface (Unix socket on Linux/macOS, TCP on Windows)")
