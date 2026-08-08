@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none';" />
+  <title>Luftspiegel</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none">
+            <path d="M12 3c4.5 0 8.3 2.6 10 6.3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            <path d="M12 8c2.6 0 4.9 1.5 6 3.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            <circle cx="12" cy="14.5" r="1.6" fill="currentColor"/>
+            <path d="M2 9.3C3.7 5.6 7.5 3 12 3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            <path d="M6 11.8c1.1-2.3 3.4-3.8 6-3.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <h1>Luftspiegel</h1>
+      </div>
+      <div class="conn-pill" id="connPill" data-state="disconnected">
+        <span class="dot"></span>
+        <span id="connLabel">Getrennt</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel devices-panel">
+        <div class="panel-head">
+          <h2>Geräte</h2>
+          <button id="btnDiscover" class="btn btn-ghost" type="button">Suchen</button>
+        </div>
+        <ul id="deviceList" class="device-list" aria-live="polite">
+          <li class="device-empty">Keine Geräte gefunden.</li>
+        </ul>
+
+        <div class="divider"></div>
+
+        <h3 class="subhead">Manuelle Verbindung</h3>
+        <p class="hint hint-small">Bei aktivem VPN funktioniert die automatische Suche oft nicht — IP direkt eintragen.</p>
+        <form id="manualForm" class="manual-form">
+          <label class="field">
+            <span>IP-Adresse</span>
+            <input type="text" id="manualIp" placeholder="192.168.178.125" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>Port</span>
+            <input type="number" id="manualPort" value="7000" min="1" max="65535" />
+          </label>
+          <button type="submit" class="btn btn-secondary">Als Ziel übernehmen</button>
+        </form>
+      </section>
+
+      <section class="panel main-panel">
+        <div class="target-card">
+          <div class="target-info">
+            <span class="target-label">Ausgewähltes Ziel</span>
+            <span id="targetName" class="target-name">Kein Gerät gewählt</span>
+            <span id="targetIp" class="target-ip"></span>
+          </div>
+          <div class="target-actions">
+            <button id="btnStart" class="btn btn-accent" type="button" disabled>Start</button>
+            <button id="btnStop" class="btn btn-danger" type="button" disabled>Stop</button>
+          </div>
+        </div>
+
+        <div id="errorBanner" class="banner banner-err hidden" role="alert">
+          <span id="errorBannerText" class="banner-text"></span>
+          <button id="errorBannerDismiss" class="banner-dismiss" type="button" aria-label="Fehlermeldung schließen">&times;</button>
+        </div>
+        <div id="sidecarBanner" class="banner banner-warn hidden" role="status"></div>
+
+        <div class="settings-card">
+          <h3 class="subhead">Einstellungen</h3>
+          <div class="settings-grid">
+            <fieldset class="field radio-field" id="fpsField">
+              <legend>Bildrate</legend>
+              <label class="radio-label"><input type="radio" name="fps" value="30" /> 30 fps</label>
+              <label class="radio-label"><input type="radio" name="fps" value="60" /> 60 fps</label>
+            </fieldset>
+
+            <label class="field">
+              <span>Maximale Höhe</span>
+              <select id="maxHeight">
+                <option value="0">Nativ</option>
+                <option value="1080">1080p</option>
+                <option value="720">720p</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>Bitrate (kbit/s, 0 = automatisch)</span>
+              <input type="number" id="bitrate" min="0" step="500" value="0" />
+            </label>
+
+            <label class="field">
+              <span>Monitor</span>
+              <select id="monitorSelect"></select>
+            </label>
+          </div>
+          <p class="hint">Änderungen starten den Sidecar automatisch neu — eine laufende Verbindung wird vorher sauber getrennt.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="pinOverlay" class="overlay hidden">
+    <div class="modal">
+      <h3>PIN erforderlich</h3>
+      <p>Der Apple TV zeigt gerade eine PIN auf dem Bildschirm an. Bitte hier eingeben:</p>
+      <form id="pinForm">
+        <input type="text" id="pinInput" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="0000" />
+        <div class="modal-actions">
+          <button type="button" id="pinCancel" class="btn btn-ghost">Abbrechen</button>
+          <button type="submit" class="btn btn-accent">Bestätigen</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

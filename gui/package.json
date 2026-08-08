@@ -1,0 +1,58 @@
+{
+  "name": "luftspiegel-gui",
+  "version": "1.0.0",
+  "description": "Desktop-Oberfläche für den Luftspiegel AirPlay-Sender",
+  "main": "main.js",
+  "private": true,
+  "author": "Lorenz",
+  "license": "GPL-3.0",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --arm64"
+  },
+  "devDependencies": {
+    "electron": "^42.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "de.lorenz.luftspiegel",
+    "productName": "Luftspiegel",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "../bin/luftspiegel.exe",
+        "to": "luftspiegel.exe"
+      },
+      {
+        "from": "../bin/ffmpeg.exe",
+        "to": "ffmpeg.exe"
+      },
+      {
+        "from": "../bin/ffprobe.exe",
+        "to": "ffprobe.exe"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["arm64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerLanguages": ["de_DE"],
+      "language": "1031"
+    }
+  }
+}

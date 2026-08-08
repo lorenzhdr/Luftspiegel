@@ -7,9 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,6 +68,9 @@ type DeviceInfo struct {
 
 // Config holds daemon configuration.
 type Config struct {
+	// SocketPath is the control channel address: a Unix domain socket path
+	// on Unix-likes, or a TCP "host:port"/bare-port address on Windows (see
+	// DefaultControlAddr and control_windows.go).
 	SocketPath  string
 	CredFile    string
 	CredBackend string
@@ -81,15 +83,25 @@ type Config struct {
 	DirectKey   bool
 	NoAudio     bool
 	ShowCursor  bool
+
+	// MaxHeight and OutputIndex are forwarded to airplay.CaptureConfig; see
+	// its docs. Windows-only, ignored on Linux.
+	MaxHeight   int
+	OutputIndex int
 }
 
-// DefaultSocketPath returns the default socket path using XDG_RUNTIME_DIR.
-func DefaultSocketPath() string {
-	dir := os.Getenv("XDG_RUNTIME_DIR")
-	if dir == "" {
-		dir = "/tmp"
-	}
-	return filepath.Join(dir, "doubletake.sock")
+// DefaultControlAddr returns the default control channel address: a Unix
+// domain socket path derived from XDG_RUNTIME_DIR on Unix-likes, or a
+// loopback-only TCP address ("127.0.0.1:7654") on Windows.
+func DefaultControlAddr() string {
+	return defaultControlAddr()
+}
+
+// DialControl connects to a running daemon's control channel at addr, using
+// the platform-appropriate transport (Unix domain socket on Unix-likes, TCP
+// on Windows). It is the single dial path shared by daemonclient.
+func DialControl(addr string, timeout time.Duration) (net.Conn, error) {
+	return dialControl(addr, timeout)
 }
 
 // activeStream tracks the state of a single mirroring session to one receiver.
@@ -114,17 +126,67 @@ type Daemon struct {
 	deviceLastSeen map[string]time.Time // keyed by IP
 	credStore      *airplay.CredentialStore
 
+	// loggedDeviceSignature is the deviceSetSignature of the last device set
+	// that was actually logged (see logDiscoveryOutcomeLocked). Used so a
+	// scan that simply reconfirms an already-known set of devices doesn't
+	// log anything without -debug.
+	loggedDeviceSignature string
+
 	// Multi-stream state
 	streams       map[string]*activeStream  // keyed by target IP
 	broadcast     *airplay.BroadcastCapture // shared video fan-out; nil when no streams active
 	capture       *airplay.ScreenCapture    // underlying screen capture
 	captureCancel context.CancelFunc        // cancellation for shared capture context
 
+	// captureStopExpected is set to true, under d.mu, immediately before we
+	// intentionally tear down the current capture (disconnect/shutdown), and
+	// back to false when a fresh capture is published. The capture's Run()
+	// goroutine consults it (also under d.mu) after Run() returns to decide
+	// whether the resulting "closed pipe"-style error is an expected side
+	// effect of our own teardown or a genuine, unexpected capture failure.
+	//
+	// This is deliberately a flag guarded by d.mu rather than a check against
+	// the capture's context: setting the flag happens inside the very same
+	// mutex-protected call that goes on to cancel the context and stop the
+	// capture, and the goroutine can only read the flag by acquiring that
+	// same mutex — so whichever of "flag set" vs. "Run() observes the stop"
+	// happens first in wall-clock time, the reader is guaranteed (by mutual
+	// exclusion, not by timing) to see the flag already set once it gets the
+	// lock. A context.Err() check does not have that guarantee: nothing
+	// forces the goroutine's read of ctx.Err() to happen after the cancel
+	// has become visible relative to the unrelated pipe-close that actually
+	// wakes Run() up.
+	captureStopExpected bool
+
 	// PIN-waiting state (at most one device waits for a PIN at a time)
 	pendingTarget string
 
 	discoverCancel context.CancelFunc
 	listener       net.Listener
+
+	// runCtx is the context passed to Run, used to bound and cancel
+	// on-demand discovery scans triggered by the "discover" command. Nil
+	// until Run has been called (e.g. in unit tests that drive handlers
+	// directly), in which case on-demand scans fall back to
+	// context.Background().
+	runCtx context.Context
+
+	// fallbackScan is non-nil while a TCP subnet fallback scan (the
+	// expensive /24 sweep) is in flight. This is the one piece of discovery
+	// work that genuinely must not run twice concurrently, so it alone gets
+	// a single-flight gate — see runFallbackScan. mDNS browsing is cheap
+	// enough that concurrent callers each just run their own; there's
+	// nothing to coalesce there.
+	fallbackScan *fallbackScanState
+}
+
+// fallbackScanState is the shared result of one in-flight (or just
+// completed) TCP subnet fallback scan; see Daemon.fallbackScan and
+// Daemon.runFallbackScan.
+type fallbackScanState struct {
+	wg    sync.WaitGroup
+	found []airplay.AirPlayDevice
+	err   error
 }
 
 // New creates a new Daemon with the given configuration.
@@ -167,23 +229,17 @@ func New(cfg Config) (*Daemon, error) {
 func (d *Daemon) Run(ctx context.Context) error {
 	airplay.DebugMode = d.cfg.Debug
 
-	// Clean up stale socket
-	if err := os.Remove(d.cfg.SocketPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove stale socket: %w", err)
-	}
+	d.mu.Lock()
+	d.runCtx = ctx
+	d.mu.Unlock()
 
-	ln, err := net.Listen("unix", d.cfg.SocketPath)
+	ln, err := listenControl(d.cfg.SocketPath)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", d.cfg.SocketPath, err)
+		return err
 	}
 	d.listener = ln
-	// Owner-only permissions
-	if err := os.Chmod(d.cfg.SocketPath, 0700); err != nil {
-		ln.Close()
-		return fmt.Errorf("chmod socket: %w", err)
-	}
 
-	log.Printf("[daemon] listening on %s", d.cfg.SocketPath)
+	log.Printf("[daemon] listening on %s", ln.Addr().String())
 
 	// Start continuous mDNS discovery in the background
 	discoverCtx, discoverCancel := context.WithCancel(ctx)
@@ -220,64 +276,361 @@ func (d *Daemon) Shutdown() {
 	if d.listener != nil {
 		d.listener.Close()
 	}
-	os.Remove(d.cfg.SocketPath)
+	cleanupControlAddr(d.cfg.SocketPath)
 }
 
-// backgroundDiscover continuously browses mDNS for AirPlay devices.
-// Each scan runs for 5 seconds. Devices not seen for >30 seconds are removed.
+const (
+	// mdnsBrowseTimeout bounds a single mDNS browse attempt, for both the
+	// background loop and an on-demand scan. A real receiver answers within
+	// milliseconds; this timeout only ever matters when nothing is going to
+	// answer at all (e.g. multicast blocked by a VPN, another responder
+	// squatting on UDP 5353), so keeping it short costs nothing on a
+	// working network and saves seconds on this one.
+	mdnsBrowseTimeout = 1500 * time.Millisecond
+
+	// deviceTTL is how long a discovered device is kept in the cache after
+	// its last sighting before it is dropped.
+	deviceTTL = 30 * time.Second
+
+	// backgroundScanInterval is the minimum time between the start of one
+	// background discovery scan (mDNS, plus a subnet fallback scan when
+	// allowed — see backgroundFallbackInterval) and the next, independent of
+	// how quickly an individual scan completes.
+	backgroundScanInterval = 10 * time.Second
+
+	// backgroundFallbackInterval is the minimum time between the background
+	// loop's own /24 TCP fallback scans once at least one device is already
+	// cached. On a network where mDNS never resolves (VPN, a competing
+	// responder), the loop would otherwise run a full subnet sweep every
+	// backgroundScanInterval, indefinitely, for as long as the daemon is up
+	// — real network/battery cost for zero new information once the
+	// receiver everyone cares about is already known. 90s keeps the cache
+	// self-healing at a sane pace (a receiver that appears after being off
+	// gets picked up within a minute and a half without the user having to
+	// press "search") while cutting scan frequency 9x. It does not affect
+	// the on-demand "discover" command, which always scans immediately
+	// regardless of this interval (see handleDiscover/discoverParallel).
+	backgroundFallbackInterval = 90 * time.Second
+)
+
+// backgroundDiscover continuously browses mDNS for AirPlay devices, at most
+// once every backgroundScanInterval. The TCP subnet fallback scan only rides
+// along under one of these conditions, checked fresh each cycle:
+//   - no device is cached yet (fast first-find matters, so scan every cycle
+//     until something is found), or
+//   - at least backgroundFallbackInterval has passed since the loop's own
+//     last fallback scan (keeps the cache eventually-consistent without
+//     scanning the /24 every ~10s forever), and
+//   - no stream is currently active (a live mirror session shouldn't share
+//     bandwidth/CPU with a subnet sweep nobody asked for).
+//
+// The "discover" command does not wait for this loop's next cycle and is
+// not subject to any of the above — it always runs an immediate scan (see
+// handleDiscover), sharing this loop's in-flight fallback scan when the
+// timing overlaps (via runFallbackScan) rather than running a redundant /24
+// sweep.
 func (d *Daemon) backgroundDiscover(ctx context.Context) {
-	const (
-		scanDuration = 5 * time.Second
-		deviceTTL    = 30 * time.Second
-	)
 	log.Printf("[daemon] starting continuous mDNS discovery")
+	var lastFallback time.Time
 	for {
-		browseCtx, cancel := context.WithTimeout(ctx, scanDuration)
-		found, err := airplay.DiscoverAirPlayDevices(browseCtx)
-		cancel()
+		cycleStart := time.Now()
 
-		if ctx.Err() != nil {
-			return
-		}
-
-		now := time.Now()
 		d.mu.Lock()
-		if err == nil {
-			// Build a map of currently known devices by IP for quick lookup
-			known := make(map[string]airplay.AirPlayDevice, len(d.devices))
-			for _, dev := range d.devices {
-				known[dev.IP] = dev
-			}
-
-			// Update last-seen timestamps and merge new devices
-			for _, dev := range found {
-				d.deviceLastSeen[dev.IP] = now
-				known[dev.IP] = dev // add or update
-			}
-
-			// Rebuild device list, dropping anything older than TTL
-			devices := make([]airplay.AirPlayDevice, 0, len(known))
-			for ip, dev := range known {
-				if now.Sub(d.deviceLastSeen[ip]) <= deviceTTL {
-					devices = append(devices, dev)
-				} else {
-					delete(d.deviceLastSeen, ip)
-				}
-			}
-			d.devices = devices
-			sort.Slice(d.devices, func(i, j int) bool {
-				return d.devices[i].IP < d.devices[j].IP
-			})
-		} else {
-			log.Printf("[daemon] mDNS browse error: %v", err)
-		}
+		haveDevice := len(d.devices) > 0
+		streaming := len(d.streams) > 0
 		d.mu.Unlock()
 
-		// Next scan starts immediately (no extra wait — the 5s scan is the cadence)
+		allowFallback := !streaming && (!haveDevice || time.Since(lastFallback) >= backgroundFallbackInterval)
+
 		if ctx.Err() != nil {
 			return
 		}
+		found, ok, usedFallback := d.discoverSequential(ctx, allowFallback)
+		if usedFallback {
+			lastFallback = time.Now()
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if ok {
+			now := time.Now()
+			d.mu.Lock()
+			d.mergeDiscoveredLocked(found, now)
+			d.logDiscoveryOutcomeLocked()
+			d.mu.Unlock()
+		}
+
+		if remaining := backgroundScanInterval - time.Since(cycleStart); remaining > 0 {
+			select {
+			case <-time.After(remaining):
+			case <-ctx.Done():
+				return
+			}
+		}
 	}
+}
+
+// performDiscoverScan runs one discovery pass using the given strategy and
+// merges whatever it finds into the device cache. Used by the on-demand
+// "discover" command (with discoverParallel, which is never throttled —
+// see backgroundDiscover for where the throttling lives). Must NOT be
+// called with d.mu held.
+func (d *Daemon) performDiscoverScan(ctx context.Context, scan func(context.Context) ([]airplay.AirPlayDevice, bool)) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	found, ok := scan(ctx)
+
+	if ctx.Err() != nil || !ok {
+		// Hard failure (or shutdown mid-scan) — leave the existing cache
+		// alone rather than wiping it out. ok is still true for a clean
+		// "scanned, found nothing" result, which does update the cache (and
+		// lets deviceTTL expire stale entries).
+		return
+	}
+
+	now := time.Now()
+	d.mu.Lock()
+	d.mergeDiscoveredLocked(found, now)
+	d.logDiscoveryOutcomeLocked()
+	d.mu.Unlock()
+}
+
+// logDiscoveryOutcomeLocked logs the current set of known devices, but only
+// when it differs from the last set that was logged — repeating "found the
+// same device(s) again" on every scan is exactly the log spam the
+// background loop used to produce every ~10s indefinitely. An actual change
+// (a device appears, or one drops out of the cache after deviceTTL) always
+// gets a line; an unchanged result only appears with -debug. Must be called
+// with d.mu held, after mergeDiscoveredLocked.
+func (d *Daemon) logDiscoveryOutcomeLocked() {
+	sig := deviceSetSignature(d.devices)
+	if sig == d.loggedDeviceSignature {
+		if d.cfg.Debug {
+			log.Printf("[daemon] discovery scan: %d known device(s), unchanged", len(d.devices))
+		}
+		return
+	}
+	d.loggedDeviceSignature = sig
+
+	if len(d.devices) == 0 {
+		log.Printf("[daemon] no AirPlay devices known (none found, or all expired)")
+		return
+	}
+	names := make([]string, len(d.devices))
+	for i, dev := range d.devices {
+		names[i] = fmt.Sprintf("%s (%s)", dev.Name, dev.IP)
+	}
+	log.Printf("[daemon] known AirPlay devices: %s", strings.Join(names, ", "))
+}
+
+// deviceSetSignature builds a comparable summary of a device list for
+// logDiscoveryOutcomeLocked's change detection. devices is already sorted by
+// IP (mergeDiscoveredLocked does this), so equal sets always produce equal
+// signatures regardless of scan order.
+func deviceSetSignature(devices []airplay.AirPlayDevice) string {
+	parts := make([]string, len(devices))
+	for i, dev := range devices {
+		parts[i] = dev.IP + "|" + dev.DeviceID + "|" + dev.Name
+	}
+	return strings.Join(parts, ";")
+}
+
+// runFallbackScan runs the TCP subnet fallback scan (DiscoverAirPlayDevicesFallback),
+// coalescing concurrent callers into a single in-flight /24 sweep. This is
+// the one part of discovery expensive enough to need real single-flight
+// protection — mDNS is cheap enough that each caller just runs its own (see
+// discoverParallel) — so it is the only thing gated here, and every call
+// site that needs the fallback scan (both discoverSequential and
+// discoverParallel, whether triggered by the background loop or an
+// on-demand "discover") goes through this one method. That is also what
+// lets an on-demand parallel scan get a fast answer even while the
+// background loop's own (sequential, slower) scan is mid-flight: it doesn't
+// wait for that whole scan, it just runs (or joins) the fallback here
+// directly, without also having to sit through that other scan's mDNS
+// phase.
+func (d *Daemon) runFallbackScan(ctx context.Context) ([]airplay.AirPlayDevice, error) {
+	d.mu.Lock()
+	if d.fallbackScan != nil {
+		state := d.fallbackScan
+		d.mu.Unlock()
+		state.wg.Wait()
+		return state.found, state.err
+	}
+	state := &fallbackScanState{}
+	state.wg.Add(1)
+	d.fallbackScan = state
+	d.mu.Unlock()
+
+	found, err := airplay.DiscoverAirPlayDevicesFallback(ctx)
+	// Log errors here, exactly once per actual scan, not in each caller:
+	// several callers (the background loop plus one or more on-demand
+	// "discover" commands) can all be waiting on this same in-flight scan,
+	// and logging in discoverSequential/discoverParallel instead would
+	// print one line per *caller* even though only one /24 sweep actually
+	// ran. A successful scan's outcome is logged by the caller's merge into
+	// the device cache (logDiscoveryOutcomeLocked), which — unlike this
+	// method — knows whether the result actually changed anything and can
+	// stay quiet when it didn't.
+	if err != nil {
+		log.Printf("[daemon] discovery fallback scan error: %v", err)
+	}
+
+	d.mu.Lock()
+	state.found, state.err = found, err
+	d.fallbackScan = nil
+	d.mu.Unlock()
+	state.wg.Done()
+
+	return found, err
+}
+
+// discoverSequential runs mDNS to completion first, only falling back to the
+// directed TCP subnet scan (via runFallbackScan) if mDNS returned nothing
+// AND allowFallback is true. Used by the continuous background loop, which
+// decides allowFallback each cycle (see its doc) to avoid scanning the
+// local /24 indefinitely once a device is already known. usedFallback
+// reports whether the fallback scan actually ran (as opposed to being
+// skipped by allowFallback=false, or skipped because mDNS itself
+// succeeded), so the caller can pace its own throttling correctly. ok is
+// false only on a hard failure, or a deliberate skip, that should leave the
+// device cache untouched — a clean scan that simply found nothing still
+// reports ok=true.
+func (d *Daemon) discoverSequential(ctx context.Context, allowFallback bool) (found []airplay.AirPlayDevice, ok bool, usedFallback bool) {
+	browseCtx, cancel := context.WithTimeout(ctx, mdnsBrowseTimeout)
+	mdnsFound, mdnsErr := airplay.DiscoverAirPlayDevices(browseCtx)
+	cancel()
+
+	if ctx.Err() != nil {
+		return nil, false, false
+	}
+	if mdnsErr != nil {
+		log.Printf("[daemon] mDNS browse error: %v", mdnsErr)
+	}
+	// mDNS can fail entirely (e.g. UDP 5353 already owned by another
+	// responder, or a VPN interfering with multicast) even though receivers
+	// are reachable. Fall back to a directed TCP scan of the local subnet
+	// only when mDNS turned up nothing — never in addition to a successful
+	// mDNS result.
+	if mdnsErr == nil && len(mdnsFound) > 0 {
+		return mdnsFound, true, false
+	}
+
+	if !allowFallback {
+		// Nothing fresh to report this cycle: mDNS found nothing (as
+		// usual on this network) and the background loop has decided not
+		// to re-scan the subnet right now. Report "no result" rather than
+		// "scanned, found nothing" so the cache (and its TTL-based pruning,
+		// which only runs on an actual merge) is left exactly as it was —
+		// silence here must not look like a fresh "confirmed empty" scan.
+		return nil, false, false
+	}
+
+	// runFallbackScan logs the outcome itself (see its doc for why that log
+	// must live there and not here).
+	fbFound, fbErr := d.runFallbackScan(ctx)
+	if ctx.Err() != nil {
+		return nil, false, true
+	}
+	if fbErr != nil {
+		if mdnsErr != nil {
+			return nil, false, true // both mDNS and the fallback failed hard
+		}
+		return mdnsFound, true, true // mDNS itself succeeded, just with zero devices
+	}
+	return fbFound, true, true
+}
+
+// discoverParallel runs the mDNS browse and the TCP subnet fallback scan
+// (via runFallbackScan) concurrently and merges their results (deduplicated
+// by IP, with mDNS entries winning on collision since mDNS's TXT records
+// give a cleaner device name than the fallback's bare /info parse). Used by
+// the on-demand "discover" command so its response time is roughly the
+// slower of the two paths instead of their sum, and — because it goes
+// through runFallbackScan rather than calling the fallback scan directly —
+// so it never has to wait out an unrelated in-flight background scan's own
+// mDNS phase just to get a fast answer. See discoverSequential for the
+// ok=false contract.
+func (d *Daemon) discoverParallel(ctx context.Context) (found []airplay.AirPlayDevice, ok bool) {
+	var (
+		wg                 sync.WaitGroup
+		mdnsFound, fbFound []airplay.AirPlayDevice
+		mdnsErr, fbErr     error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		browseCtx, cancel := context.WithTimeout(ctx, mdnsBrowseTimeout)
+		mdnsFound, mdnsErr = airplay.DiscoverAirPlayDevices(browseCtx)
+		cancel()
+	}()
+	go func() {
+		defer wg.Done()
+		fbFound, fbErr = d.runFallbackScan(ctx)
+	}()
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		return nil, false
+	}
+	if mdnsErr != nil {
+		log.Printf("[daemon] mDNS browse error: %v", mdnsErr)
+	}
+	// runFallbackScan already logged the fallback outcome itself.
+	if mdnsErr != nil && fbErr != nil {
+		return nil, false // both paths failed hard
+	}
+
+	return mergeDeviceLists(mdnsFound, fbFound), true
+}
+
+// mergeDeviceLists merges two device lists, deduplicating by IP; on a
+// collision the entry from primary is kept.
+func mergeDeviceLists(primary, secondary []airplay.AirPlayDevice) []airplay.AirPlayDevice {
+	byIP := make(map[string]airplay.AirPlayDevice, len(primary)+len(secondary))
+	for _, dev := range secondary {
+		byIP[dev.IP] = dev
+	}
+	for _, dev := range primary {
+		byIP[dev.IP] = dev // primary overwrites secondary on collision
+	}
+	merged := make([]airplay.AirPlayDevice, 0, len(byIP))
+	for _, dev := range byIP {
+		merged = append(merged, dev)
+	}
+	return merged
+}
+
+// mergeDiscoveredLocked merges freshly discovered devices into the device
+// cache, refreshing their last-seen timestamps, and drops any cached device
+// not seen within deviceTTL. Must be called with d.mu held.
+func (d *Daemon) mergeDiscoveredLocked(found []airplay.AirPlayDevice, now time.Time) {
+	// Build a map of currently known devices by IP for quick lookup
+	known := make(map[string]airplay.AirPlayDevice, len(d.devices))
+	for _, dev := range d.devices {
+		known[dev.IP] = dev
+	}
+
+	// Update last-seen timestamps and merge new devices
+	for _, dev := range found {
+		d.deviceLastSeen[dev.IP] = now
+		known[dev.IP] = dev // add or update
+	}
+
+	// Rebuild device list, dropping anything older than TTL
+	devices := make([]airplay.AirPlayDevice, 0, len(known))
+	for ip, dev := range known {
+		if now.Sub(d.deviceLastSeen[ip]) <= deviceTTL {
+			devices = append(devices, dev)
+		} else {
+			delete(d.deviceLastSeen, ip)
+		}
+	}
+	d.devices = devices
+	sort.Slice(d.devices, func(i, j int) bool {
+		return d.devices[i].IP < d.devices[j].IP
+	})
 }
 
 func (d *Daemon) handleConn(conn net.Conn) {
@@ -343,6 +696,16 @@ func (d *Daemon) overallStateLocked() State {
 	return StateIdle
 }
 
+// streamHasAudio reports whether a stream's audio should be advertised to
+// callers. The receiver may negotiate audio ports during SETUP whenever it
+// offers them, independent of Config.NoAudio — that flag only stops the
+// daemon from starting the local audio capture pipeline. So with -no-audio
+// set, no audio is ever actually flowing, and has_audio must report false
+// even though session.HasAudio() (a negotiation-level fact) is true.
+func (d *Daemon) streamHasAudio(s *activeStream) bool {
+	return !d.cfg.NoAudio && s.session != nil && s.session.HasAudio()
+}
+
 func (d *Daemon) handleStatus() Response {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -356,7 +719,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 			Device:     s.device,
 			DeviceIP:   s.deviceIP,
 			State:      s.state,
-			HasAudio:   s.session != nil && s.session.HasAudio(),
+			HasAudio:   d.streamHasAudio(s),
 			AudioMuted: s.audioMuted,
 		})
 	}
@@ -394,7 +757,29 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	}
 }
 
+// handleDiscover runs a fresh discovery scan and returns whatever it finds
+// in the same response. This deliberately does not rely on the background
+// discovery loop's cache: on machines where mDNS never works (VPN, a
+// competing responder, ...) the fallback is the normal path, and a caller
+// that queries "discover" right after starting the daemon must not see an
+// empty list just because the background loop hasn't gotten there yet. The
+// scan runs mDNS and the TCP subnet fallback in parallel (discoverParallel)
+// so a GUI's "Suchen" button isn't stuck waiting for a mDNS timeout and then
+// a full fallback scan back to back — and, because the fallback scan alone
+// is single-flighted (runFallbackScan) rather than the whole scan, this does
+// not have to wait out the background loop's own scan if one happens to be
+// running at that moment either.
 func (d *Daemon) handleDiscover() Response {
+	d.mu.Lock()
+	ctx := d.runCtx
+	d.mu.Unlock()
+	if ctx == nil {
+		// Run() was never called (e.g. a unit test driving handlers
+		// directly); there is no daemon lifetime to bound the scan by.
+		ctx = context.Background()
+	}
+	d.performDiscoverScan(ctx, d.discoverParallel)
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return Response{
@@ -781,8 +1166,18 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 
 	streamErr := session.StreamFrames(ctx, sink.AsCapture(), 0)
-	if streamErr != nil && ctx.Err() == nil {
-		log.Printf("[daemon] stream error for %s: %v", target, streamErr)
+	if streamErr != nil {
+		if ctx.Err() == nil {
+			// The stream ended on its own (no disconnect/shutdown requested
+			// this), so this is a genuine, unexpected failure.
+			log.Printf("[daemon] stream error for %s: %v", target, streamErr)
+		} else if d.cfg.Debug {
+			// ctx was cancelled by an intentional disconnect/shutdown,
+			// which closes the sink's pipe out from under StreamFrames and
+			// surfaces as a "closed pipe" style error here. That is
+			// expected, not a failure — only note it at debug level.
+			log.Printf("[daemon] stream ended for %s (disconnect): %v", target, streamErr)
+		}
 	}
 
 	// Cleanup this stream.
@@ -820,6 +1215,8 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airp
 		HWAccel:      d.cfg.HWAccel,
 		ShowCursor:   d.cfg.ShowCursor,
 		RestoreToken: restoreToken,
+		OutputIndex:  d.cfg.OutputIndex,
+		MaxHeight:    d.cfg.MaxHeight,
 	}
 	if deviceID != "" {
 		capCfg.SaveRestoreToken = func(token string) error {
@@ -857,11 +1254,26 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airp
 	d.broadcast = newBC
 	d.capture = capture
 	d.captureCancel = captureCancel
+	d.captureStopExpected = false
 	d.mu.Unlock()
 
 	go func() {
-		if runErr := newBC.Run(); runErr != nil && runErr.Error() != "EOF" {
-			log.Printf("[daemon] broadcast capture error: %v", runErr)
+		runErr := newBC.Run()
+
+		d.mu.Lock()
+		stopExpected := d.captureStopExpected
+		d.mu.Unlock()
+
+		if runErr != nil && runErr.Error() != "EOF" {
+			if !stopExpected {
+				// The capture ended on its own — a real, unexpected failure.
+				log.Printf("[daemon] broadcast capture error: %v", runErr)
+			} else if d.cfg.Debug {
+				// We intentionally tore this capture down (disconnect/
+				// shutdown); the "closed pipe"-style error Run() reports
+				// here is just that teardown's side effect, not a failure.
+				log.Printf("[daemon] broadcast capture ended (stopped): %v", runErr)
+			}
 		}
 		// When the capture ends, stop all active streams.
 		d.mu.Lock()
@@ -895,6 +1307,10 @@ func (d *Daemon) maybeStopBroadcastLocked() {
 	if len(d.streams) > 0 {
 		return
 	}
+	// Mark this teardown as expected, and cancel the capture's context,
+	// before actually stopping it: see the captureStopExpected field doc for
+	// why both must happen in this order and while still holding d.mu.
+	d.captureStopExpected = true
 	if d.captureCancel != nil {
 		d.captureCancel()
 		d.captureCancel = nil
@@ -916,6 +1332,13 @@ func (d *Daemon) handleDisconnect(req Request) Response {
 		if !ok {
 			return Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
 		}
+		// Cancel the streaming goroutine's context before tearing down its
+		// sink/session/client (mirrors stopAllLocked's order below). That
+		// goroutine's own ctx.Err() check then correctly recognizes the
+		// "read on closed pipe"/connection-closed errors this causes as
+		// the expected effect of an intentional disconnect rather than a
+		// real streaming failure worth logging.
+		d.removeStreamLocked(req.Target)
 		if entry.sink != nil {
 			entry.sink.Close()
 		}
@@ -925,7 +1348,6 @@ func (d *Daemon) handleDisconnect(req Request) Response {
 		if entry.client != nil {
 			entry.client.Close()
 		}
-		d.removeStreamLocked(req.Target)
 		return Response{OK: true, State: d.overallStateLocked()}
 	}
 
@@ -1007,13 +1429,24 @@ func (d *Daemon) stopAllLocked() {
 		}
 		delete(d.streams, target)
 	}
-	if d.capture != nil {
-		d.capture.Stop()
-		d.capture = nil
-	}
+	// Mark this teardown as expected, and cancel the capture's context,
+	// before actually stopping it — see the captureStopExpected field doc.
+	// This order was previously reversed here (capture.Stop() ran before
+	// captureCancel()), which is what let the "broadcast capture error:
+	// read |0: file already closed" log line slip through on an intentional
+	// disconnect: the shared capture's Run() goroutine could wake up from
+	// capture.Stop() closing the pipe before its context was visibly
+	// cancelled, so it mistook the resulting error for an unexpected
+	// failure. maybeStopBroadcastLocked already had the correct order; this
+	// path (used by a target-less "disconnect" and by Shutdown) did not.
+	d.captureStopExpected = true
 	if d.captureCancel != nil {
 		d.captureCancel()
 		d.captureCancel = nil
+	}
+	if d.capture != nil {
+		d.capture.Stop()
+		d.capture = nil
 	}
 	d.broadcast = nil
 }

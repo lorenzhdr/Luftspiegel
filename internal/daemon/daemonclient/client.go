@@ -3,25 +3,27 @@ package daemonclient
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"time"
 
 	"doubletake/internal/daemon"
 )
 
-// Client communicates with a running doubletake daemon over its Unix socket.
+// Client communicates with a running doubletake daemon over its control
+// channel (a Unix domain socket on Unix-likes, a loopback TCP address on
+// Windows — see daemon.DialControl).
 type Client struct {
 	SocketPath string
 }
 
-// New creates a client that connects to the daemon at the given socket path.
+// New creates a client that connects to the daemon at the given control
+// channel address.
 func New(socketPath string) *Client {
 	return &Client{SocketPath: socketPath}
 }
 
-// NewDefault creates a client using the default socket path.
+// NewDefault creates a client using the default control channel address.
 func NewDefault() *Client {
-	return &Client{SocketPath: daemon.DefaultSocketPath()}
+	return &Client{SocketPath: daemon.DefaultControlAddr()}
 }
 
 // Status returns the daemon's current state.
@@ -75,7 +77,7 @@ func (c *Client) UnmuteTarget(target string) (*daemon.Response, error) {
 }
 
 func (c *Client) send(req daemon.Request) (*daemon.Response, error) {
-	conn, err := net.DialTimeout("unix", c.SocketPath, 5*time.Second)
+	conn, err := daemon.DialControl(c.SocketPath, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connect to daemon: %w", err)
 	}

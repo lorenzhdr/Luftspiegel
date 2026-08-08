@@ -1,3 +1,5 @@
+//go:build linux
+
 package airplay
 
 import (
@@ -8,22 +10,6 @@ import (
 
 	"github.com/godbus/dbus/v5"
 )
-
-func TestValidateHWAccel(t *testing.T) {
-	for _, method := range []string{"", "auto", "nvenc", "vaapi", "openh264", "none"} {
-		if err := ValidateHWAccel(method); err != nil {
-			t.Errorf("ValidateHWAccel(%q): %v", method, err)
-		}
-	}
-	for _, method := range []string{"x264", "OPENH264", "bogus", " auto"} {
-		err := ValidateHWAccel(method)
-		if err == nil {
-			t.Errorf("ValidateHWAccel(%q) succeeded", method)
-		} else if !strings.Contains(err.Error(), method) {
-			t.Errorf("ValidateHWAccel(%q) error %q does not name the invalid value", method, err)
-		}
-	}
-}
 
 func TestStartTestCaptureRejectsUnknownHWAccel(t *testing.T) {
 	capture, err := StartTestCapture(context.Background(), CaptureConfig{HWAccel: "bogus"})

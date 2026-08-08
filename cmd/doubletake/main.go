@@ -74,11 +74,14 @@ func main() {
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
-	daemonize := flag.Bool("daemonize", false, "Run as background daemon with Unix socket control interface")
-	socketPath := flag.String("socket", daemon.DefaultSocketPath(), "Unix socket path for daemon control interface")
+	daemonize := flag.Bool("daemonize", false, "Run as background daemon with a control interface (Unix socket on Linux/macOS, TCP on Windows)")
+	socketPath := flag.String("socket", daemon.DefaultControlAddr(), "Control channel address: Unix socket path on Linux/macOS; on Windows a host:port or bare port (default 127.0.0.1:7654), loopback only")
 	x11WindowID := flag.String("x11-window-id", "", "X11 window id to capture, decimal or 0xhex")
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
+	stubFile := flag.String("stub-file", "", "Replay a pre-recorded Annex-B .h264 file instead of starting a real capture backend (ffmpeg/GStreamer); loops at EOF, paced at ~fps access units/sec. For testing the mirror pipeline.")
+	maxHeight := flag.Int("max-height", 0, "Windows only: downscale ffmpeg capture so the encoded output is at most this many pixels tall (0 = native resolution); ignored on Linux")
+	outputIndex := flag.Int("output-index", 0, "Windows only: ddagrab output/monitor index to capture (0-based); ignored on Linux")
 	flag.Parse()
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
@@ -89,7 +92,7 @@ func main() {
 	airplay.DebugMode = *debug
 
 	if *daemonize {
-		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio, *noCursor)
+		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio, *noCursor, *maxHeight, *outputIndex)
 		return
 	}
 
@@ -282,9 +285,10 @@ func main() {
 		}
 		var err error
 		capture, err = airplay.StartTestCapture(ctx, airplay.CaptureConfig{
-			FPS:     *fps,
-			Bitrate: *bitrate,
-			HWAccel: *hwaccel,
+			FPS:      *fps,
+			Bitrate:  *bitrate,
+			HWAccel:  *hwaccel,
+			StubFile: *stubFile,
 		})
 		if err != nil {
 			log.Fatalf("test capture failed: %v", err)
@@ -305,6 +309,9 @@ func main() {
 			SaveRestoreToken: func(token string) error {
 				return credStore.SaveRestoreToken(info.DeviceID, token)
 			},
+			OutputIndex: *outputIndex,
+			MaxHeight:   *maxHeight,
+			StubFile:    *stubFile,
 		}
 		var err error
 		capture, err = airplay.StartCapture(ctx, captureCfg)
@@ -448,7 +455,7 @@ func compareIPs(a, b string) int {
 	return 0
 }
 
-func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio, noCursor bool) {
+func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio, noCursor bool, maxHeight, outputIndex int) {
 	cfg := daemon.Config{
 		SocketPath:  socketPath,
 		CredFile:    credFile,
@@ -462,6 +469,8 @@ func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwacc
 		DirectKey:   directKey,
 		NoAudio:     noAudio,
 		ShowCursor:  !noCursor,
+		MaxHeight:   maxHeight,
+		OutputIndex: outputIndex,
 	}
 
 	d, err := daemon.New(cfg)
