@@ -22,9 +22,15 @@
         </span>
         <h1>Luftspiegel</h1>
       </div>
-      <div class="conn-pill" id="connPill" data-state="disconnected">
-        <span class="dot"></span>
-        <span id="connLabel">Getrennt</span>
+      <div class="status-pills">
+        <div class="conn-pill audio-pill hidden" id="audioPill" data-state="disconnected">
+          <span class="dot"></span>
+          <span id="audioLabel">Ton: aus</span>
+        </div>
+        <div class="conn-pill" id="connPill" data-state="disconnected">
+          <span class="dot"></span>
+          <span id="connLabel">Getrennt</span>
+        </div>
       </div>
     </header>
 
@@ -101,8 +107,17 @@
               <span>Monitor</span>
               <select id="monitorSelect"></select>
             </label>
+
+            <label class="field checkbox-field">
+              <span>Audio</span>
+              <span class="checkbox-row">
+                <input type="checkbox" id="audioToggle" />
+                <span>Ton übertragen (System-Audio, experimentell)</span>
+              </span>
+            </label>
           </div>
           <p class="hint">Änderungen starten den Sidecar automatisch neu — eine laufende Verbindung wird vorher sauber getrennt.</p>
+          <p class="hint">Eigene Töne der App selbst können derzeit mit übertragen werden (Windows-Systembeschränkung dieser Electron-Version) — betrifft nur Klänge, die Luftspiegel selbst abspielt, nicht die Windows-Systemlautstärke.</p>
         </div>
       </section>
     </main>

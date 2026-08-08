@@ -72,6 +72,7 @@ func main() {
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
+	audioTCPPort := flag.Int("audio-tcp", airplay.DefaultAudioTCPPort, "Windows only: local TCP port (127.0.0.1) that the audio-source GUI connects to, pushing raw PCM (s16le, 48000 Hz, stereo, no header); ignored on Linux. Ignored entirely if -no-audio is set.")
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with a control interface (Unix socket on Linux/macOS, TCP on Windows)")
@@ -92,7 +93,7 @@ func main() {
 	airplay.DebugMode = *debug
 
 	if *daemonize {
-		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio, *noCursor, *maxHeight, *outputIndex)
+		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio, *noCursor, *maxHeight, *outputIndex, *audioTCPPort)
 		return
 	}
 
@@ -337,7 +338,7 @@ func main() {
 
 	// Start audio capture and streaming unless disabled.
 	if !*noAudio && session.HasAudio() {
-		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode)
+		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, *audioTCPPort)
 		if err != nil {
 			log.Printf("warning: audio capture failed: %v (continuing without audio)", err)
 		} else {
@@ -455,22 +456,23 @@ func compareIPs(a, b string) int {
 	return 0
 }
 
-func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio, noCursor bool, maxHeight, outputIndex int) {
+func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio, noCursor bool, maxHeight, outputIndex, audioTCPPort int) {
 	cfg := daemon.Config{
-		SocketPath:  socketPath,
-		CredFile:    credFile,
-		CredBackend: credBackend,
-		FPS:         fps,
-		Bitrate:     bitrate,
-		HWAccel:     hwaccel,
-		Debug:       debug,
-		TestMode:    testMode,
-		NoEncrypt:   noEncrypt,
-		DirectKey:   directKey,
-		NoAudio:     noAudio,
-		ShowCursor:  !noCursor,
-		MaxHeight:   maxHeight,
-		OutputIndex: outputIndex,
+		SocketPath:   socketPath,
+		CredFile:     credFile,
+		CredBackend:  credBackend,
+		FPS:          fps,
+		Bitrate:      bitrate,
+		HWAccel:      hwaccel,
+		Debug:        debug,
+		TestMode:     testMode,
+		NoEncrypt:    noEncrypt,
+		DirectKey:    directKey,
+		NoAudio:      noAudio,
+		ShowCursor:   !noCursor,
+		MaxHeight:    maxHeight,
+		OutputIndex:  outputIndex,
+		AudioTCPPort: audioTCPPort,
 	}
 
 	d, err := daemon.New(cfg)

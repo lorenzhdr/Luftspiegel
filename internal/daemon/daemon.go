@@ -88,6 +88,11 @@ type Config struct {
 	// its docs. Windows-only, ignored on Linux.
 	MaxHeight   int
 	OutputIndex int
+
+	// AudioTCPPort is the local TCP port airplay.StartAudioCapture listens on
+	// for raw PCM audio on Windows (see audio_windows.go); ignored on Linux.
+	// Zero (the Config zero value) means airplay.DefaultAudioTCPPort.
+	AudioTCPPort int
 }
 
 // DefaultControlAddr returns the default control channel address: a Unix
@@ -1151,7 +1156,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 
 	// Start audio for this stream independently.
 	if !d.cfg.NoAudio && session.HasAudio() {
-		audioCapture, audioErr := airplay.StartAudioCapture(ctx, d.cfg.TestMode)
+		audioCapture, audioErr := airplay.StartAudioCapture(ctx, d.cfg.TestMode, d.cfg.AudioTCPPort)
 		if audioErr != nil {
 			log.Printf("[daemon] audio capture failed: %v (continuing without audio)", audioErr)
 		} else {

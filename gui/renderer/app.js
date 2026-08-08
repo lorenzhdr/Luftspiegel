@@ -44,6 +44,9 @@
     pinForm: document.getElementById('pinForm'),
     pinInput: document.getElementById('pinInput'),
     pinCancel: document.getElementById('pinCancel'),
+    audioToggle: document.getElementById('audioToggle'),
+    audioPill: document.getElementById('audioPill'),
+    audioLabel: document.getElementById('audioLabel'),
   };
 
   // -------------------------------------------------------------------
@@ -308,6 +311,152 @@
   });
 
   // -------------------------------------------------------------------
+  // System-Audio-Erfassung (Loopback -> PCM -> Main-Prozess -> Sidecar)
+  // -------------------------------------------------------------------
+
+  /**
+   * Alles hier läuft ausschließlich im Renderer, weil getDisplayMedia/
+   * AudioWorklet nur dort verfügbar sind. Der eigentliche TCP-Versand
+   * (127.0.0.1:7655) passiert im Main-Prozess (sandbox: true, kein
+   * nodeIntegration hier) - siehe api.audio.sendChunk / preload.js.
+   */
+  let audioCaptureActive = false;
+  let audioMediaStream = null;
+  let audioCtx = null;
+  let audioSourceNode = null;
+  let audioWorkletNode = null;
+
+  function stopAudioMediaStream() {
+    if (audioMediaStream) {
+      audioMediaStream.getTracks().forEach((t) => t.stop());
+      audioMediaStream = null;
+    }
+  }
+
+  /** Räumt alle Audio-Erfassungsressourcen auf, ohne die Bridge-Anzeige zu berühren (die kommt vom Main-Prozess). */
+  function teardownAudioCapture() {
+    audioCaptureActive = false;
+    if (audioWorkletNode) {
+      audioWorkletNode.port.onmessage = null;
+      audioWorkletNode.disconnect();
+      audioWorkletNode = null;
+    }
+    if (audioSourceNode) {
+      audioSourceNode.disconnect();
+      audioSourceNode = null;
+    }
+    if (audioCtx) {
+      const ctx = audioCtx;
+      audioCtx = null;
+      ctx.close().catch(() => {});
+    }
+    stopAudioMediaStream();
+  }
+
+  /**
+   * Startet die Aufnahme. Muss aus einem Kontext mit aktiver Nutzergeste
+   * aufgerufen werden (Klick auf den Schalter) - getDisplayMedia
+   * verlangt das. Gibt true bei Erfolg zurück, sonst false (und zeigt
+   * einen Fehler im bestehenden Fehlerbanner an).
+   */
+  async function startAudioCapture() {
+    if (audioCaptureActive) return true;
+    audioCaptureActive = true;
+
+    let stream;
+    try {
+      // restrictOwnAudio verhindert (sobald von Electron unterstützt),
+      // dass die App ihre eigenen Töne mit erfasst - in dieser gepinnten
+      // Electron-Version (v42) noch ohne Wirkung, siehe Hinweistext unter
+      // dem Schalter. Der Fix landet mit Electron v44; da unbekannte
+      // Constraint-Schlüssel vom Browser ignoriert werden, kann die
+      // Option schon jetzt gefahrlos gesetzt werden.
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: { restrictOwnAudio: true },
+      });
+    } catch (err) {
+      audioCaptureActive = false;
+      showError(`Audioaufnahme fehlgeschlagen: ${err.message}`);
+      return false;
+    }
+
+    audioMediaStream = stream;
+
+    const audioTracks = stream.getAudioTracks();
+    if (!audioTracks.length) {
+      showError('Kein System-Audio verfügbar (Loopback lieferte keine Tonspur).');
+      teardownAudioCapture();
+      return false;
+    }
+
+    // Der Video-Track wird nur gebraucht, um überhaupt an den Audio-Track
+    // zu kommen (das Bild macht der Go-Sidecar per ffmpeg) - sofort
+    // stoppen, sobald wir die Tonspur haben.
+    stream.getVideoTracks().forEach((t) => t.stop());
+
+    try {
+      // sampleRate explizit setzen, sonst könnte die Systemrate abweichen
+      // und der Empfänger bekäme ein falsches Format vorgegaukelt. 44100Hz
+      // (nicht 48000!) ist vertraglich fest, weil die gesamte ALAC/RTP-
+      // Pipeline auf der Go-Seite hart auf 44100 verdrahtet ist.
+      audioCtx = new AudioContext({ sampleRate: 44100 });
+      console.log(`[audio] AudioContext.sampleRate = ${audioCtx.sampleRate} (angefordert: 44100)`);
+      if (audioCtx.sampleRate !== 44100) {
+        // Chromium ist NICHT verpflichtet, die angeforderte Rate zu
+        // liefern - im Zweifel still auf die Geräterate zurückfallen.
+        // Das wäre ein stiller Formatfehler, den nur die gemessene
+        // Byterate beim Empfänger aufdecken würde - daher hier laut
+        // melden statt nur zu loggen.
+        console.error(
+          `AudioContext.sampleRate ist ${audioCtx.sampleRate}, nicht die angeforderten 44100 Hz - PCM-Rate würde nicht zum Vertrag passen.`
+        );
+      }
+      await audioCtx.audioWorklet.addModule('pcm-worklet.js');
+    } catch (err) {
+      showError(`Audio-Worklet konnte nicht geladen werden: ${err.message}`);
+      teardownAudioCapture();
+      return false;
+    }
+
+    audioSourceNode = audioCtx.createMediaStreamSource(stream);
+    audioWorkletNode = new AudioWorkletNode(audioCtx, 'pcm-encoder', {
+      numberOfInputs: 1,
+      numberOfOutputs: 0,
+      channelCount: 2,
+      channelCountMode: 'explicit',
+    });
+    audioWorkletNode.port.onmessage = (ev) => {
+      api.audio.sendChunk(ev.data);
+    };
+    audioSourceNode.connect(audioWorkletNode);
+
+    return true;
+  }
+
+  function stopAudioCapture() {
+    teardownAudioCapture();
+  }
+
+  /** Zeigt/verbirgt und beschriftet die Ton-Statuspille (Zustand kommt vom Main-Prozess, also der TCP-Bridge zu Port 7655). */
+  function updateAudioPill(payload) {
+    const enabled = !!(currentSettings && currentSettings.audioEnabled);
+    el.audioPill.classList.toggle('hidden', !enabled);
+    if (!enabled) return;
+
+    const state = (payload && payload.state) || 'disconnected';
+    const labels = {
+      disconnected: 'Ton: aus',
+      connecting: 'Ton: verbinde…',
+      connected: 'Ton: verbunden',
+      error: 'Ton: kein Empfänger',
+    };
+    el.audioPill.dataset.state = state;
+    el.audioLabel.textContent = labels[state] || 'Ton: unbekannt';
+    el.audioPill.title = (payload && payload.detail) || '';
+  }
+
+  // -------------------------------------------------------------------
   // Einstellungen
   // -------------------------------------------------------------------
 
@@ -319,9 +468,11 @@
     });
     el.maxHeight.value = String(settings.maxHeight);
     el.bitrate.value = String(settings.bitrate);
+    el.audioToggle.checked = !!settings.audioEnabled;
     if (el.monitorSelect.options.length) {
       el.monitorSelect.value = String(settings.outputIndex);
     }
+    updateAudioPill(null);
   }
 
   function readSettingsFromForm() {
@@ -331,6 +482,7 @@
       maxHeight: Number(el.maxHeight.value),
       bitrate: Number(el.bitrate.value) || 0,
       outputIndex: Number(el.monitorSelect.value) || 0,
+      audioEnabled: !!el.audioToggle.checked,
     };
   }
 
@@ -345,6 +497,7 @@
         return;
       }
       currentSettings = resp.settings;
+      updateAudioPill(null);
       if (resp.restarted) {
         showSidecarNotice('Einstellungen übernommen, Sidecar wurde neu gestartet.');
         setTimeout(() => showSidecarNotice(null), 4000);
@@ -366,6 +519,25 @@
     el.monitorSelect,
   ].forEach((input) => {
     input.addEventListener('change', onSettingsChanged);
+  });
+
+  // Eigener Handler statt Teil der generischen Liste oben: getDisplayMedia
+  // braucht eine aktive Nutzergeste, die durch den vorgeschalteten await
+  // von api.settings.set() verloren ginge. Schlägt die Aufnahme fehl,
+  // wird der Schalter zurückgesetzt und die Einstellung NICHT übernommen
+  // (der Sidecar bleibt unangetastet).
+  el.audioToggle.addEventListener('change', async () => {
+    const enabling = el.audioToggle.checked;
+    if (enabling) {
+      const ok = await startAudioCapture();
+      if (!ok) {
+        el.audioToggle.checked = false;
+        return;
+      }
+    } else {
+      stopAudioCapture();
+    }
+    await onSettingsChanged();
   });
 
   // -------------------------------------------------------------------
@@ -431,6 +603,7 @@
         showSidecarNotice(payload && payload.message ? payload.message : 'Unbekannter Sidecar-Fehler.');
       })
     );
+    unsubscribers.push(api.on('audio:status', (payload) => updateAudioPill(payload)));
     unsubscribers.push(
       api.on('device:updated', (resp) => {
         // Billiger Hintergrund-Refresh (nutzt den Geräte-Cache, löst KEINEN
@@ -463,6 +636,42 @@
       fillSettingsForm(settings);
     } catch (err) {
       showError(`Einstellungen konnten nicht geladen werden: ${err.message}`);
+    }
+
+    try {
+      // Pull-Fallback für den Audio-Bridge-Zustand: der 'audio:status'-Push
+      // vom Main-Prozess kann verloren gehen, falls die Verbindung zu 7655
+      // (ausgelöst durch einen bereits beim Start persistierten
+      // audioEnabled:true) schon steht, bevor subscribeEvents() oben
+      // fertig registriert ist. Ohne diesen aktiven Abruf würde die Pille
+      // dauerhaft "aus" anzeigen, obwohl im Hintergrund längst Ton fließt.
+      const audioStatus = await api.audio.status();
+      updateAudioPill(audioStatus);
+    } catch (err) {
+      /* nicht kritisch - der nächste Push aktualisiert die Anzeige */
+    }
+
+    if (currentSettings && currentSettings.audioEnabled) {
+      // Persistierter Zustand "Ton übertragen" war beim letzten Beenden
+      // aktiv. getDisplayMedia verlangt laut Spezifikation eine
+      // Nutzergeste; in Tests startete der automatische Wiederanlauf über
+      // den Electron-eigenen setDisplayMediaRequestHandler aber auch ohne
+      // vorherige Geste zuverlässig (kein Berechtigungsdialog, den Chromium
+      // sonst an eine Geste koppelt). Der Fallback bleibt trotzdem als
+      // Sicherheitsnetz bestehen, falls sich das in einer anderen
+      // Electron/Chromium-Version anders verhält.
+      const ok = await startAudioCapture();
+      if (!ok) {
+        el.audioToggle.checked = false;
+        try {
+          await onSettingsChanged();
+        } catch (err) {
+          /* onSettingsChanged zeigt Fehler bereits selbst an */
+        }
+        showSidecarNotice(
+          'Ton übertragen konnte beim Start nicht automatisch fortgesetzt werden (keine Nutzergeste) — bitte den Schalter erneut betätigen.'
+        );
+      }
     }
 
     try {

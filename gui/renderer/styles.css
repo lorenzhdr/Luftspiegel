@@ -156,6 +156,12 @@ button {
 /* Verbindungsstatus-Pille                                      */
 /* ---------------------------------------------------------- */
 
+.status-pills {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .conn-pill {
   display: flex;
   align-items: center;
@@ -323,6 +329,26 @@ button {
   color: var(--text-faint);
   margin-top: 10px;
   line-height: 1.5;
+}
+
+.checkbox-field {
+  justify-content: center;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.checkbox-row input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .hint-small {

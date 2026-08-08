@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
@@ -12,6 +12,13 @@ const { spawn } = require('child_process');
 
 const CONTROL_HOST = '127.0.0.1';
 const CONTROL_PORT = 7654;
+
+// TCP-Gegenstelle für rohes PCM (s16le, 44100 Hz, stereo, kein Header):
+// der Go-Sidecar ist hier der Server, die GUI verbindet sich als Client.
+const AUDIO_HOST = '127.0.0.1';
+const AUDIO_PORT = 7655;
+const AUDIO_RECONNECT_MIN_MS = 500;
+const AUDIO_RECONNECT_MAX_MS = 8000;
 
 const STATUS_POLL_INTERVAL_MS = 2000;
 const SIDECAR_READY_TIMEOUT_MS = 6000;
@@ -28,6 +35,7 @@ const DEFAULT_SETTINGS = {
   maxHeight: 1080, // 0 = native
   outputIndex: 0,
   bitrate: 0, // 0 = automatisch
+  audioEnabled: false, // Video ist erprobt, Audio ist neu - Default aus
 };
 
 const BACKGROUND_COLOR = '#0f1417';
@@ -40,6 +48,23 @@ let mainWindow = null;
 let statusPollTimer = null;
 let settings = { ...DEFAULT_SETTINGS };
 let lastSidecarError = null;
+
+/**
+ * TCP-Client-Verbindung zum Audio-Port des Go-Sidecars (127.0.0.1:7655).
+ * Wird nur gehalten, während der Sidecar läuft/adoptiert ist UND
+ * settings.audioEnabled true ist (siehe syncAudioBridgeWanted). Reißt die
+ * Verbindung ab, wird mit exponentiellem Backoff erneut versucht, statt
+ * aufzugeben - ein Abbruch hier darf die App nie zum Absturz bringen und
+ * das Video (das über den Go-Sidecar separat läuft) nicht beeinträchtigen.
+ */
+const audioBridge = {
+  socket: null,
+  wantConnected: false,
+  reconnectTimer: null,
+  reconnectDelay: AUDIO_RECONNECT_MIN_MS,
+  writable: false, // false während socket.write() zuletzt Rückstau meldete
+  state: 'disconnected', // 'disconnected' | 'connecting' | 'connected' | 'error'
+};
 
 const sidecar = {
   child: null,
@@ -98,7 +123,9 @@ function sanitizeSettings(input) {
   if (bitrate < 0) bitrate = 0;
   if (bitrate > 100000) bitrate = 100000; // Plausibilitätsdeckel (kbps)
 
-  return { fps, maxHeight, outputIndex, bitrate };
+  const audioEnabled = src.audioEnabled === true;
+
+  return { fps, maxHeight, outputIndex, bitrate, audioEnabled };
 }
 
 /** Vergleicht nur die Felder, die den Sidecar-Neustart erzwingen. */
@@ -107,7 +134,8 @@ function daemonFlagsChanged(a, b) {
     a.fps !== b.fps ||
     a.maxHeight !== b.maxHeight ||
     a.outputIndex !== b.outputIndex ||
-    a.bitrate !== b.bitrate
+    a.bitrate !== b.bitrate ||
+    a.audioEnabled !== b.audioEnabled
   );
 }
 
@@ -228,6 +256,106 @@ function sendControlCommand(cmdObj, timeoutMs = DEFAULT_TIMEOUT_MS) {
 }
 
 // ---------------------------------------------------------------------------
+// Audio-Bridge: TCP-Client zum PCM-Port des Sidecars (127.0.0.1:7655)
+// ---------------------------------------------------------------------------
+
+function setAudioState(state, detail) {
+  if (audioBridge.state === state) return;
+  audioBridge.state = state;
+  notifyRenderer('audio:status', { state, detail: detail || null });
+}
+
+function scheduleAudioReconnect() {
+  if (!audioBridge.wantConnected) return;
+  if (audioBridge.reconnectTimer) return;
+  audioBridge.reconnectTimer = setTimeout(() => {
+    audioBridge.reconnectTimer = null;
+    connectAudioBridge();
+  }, audioBridge.reconnectDelay);
+  audioBridge.reconnectDelay = Math.min(audioBridge.reconnectDelay * 2, AUDIO_RECONNECT_MAX_MS);
+}
+
+function connectAudioBridge() {
+  if (!audioBridge.wantConnected || audioBridge.socket) return;
+
+  setAudioState('connecting');
+  const socket = new net.Socket();
+  audioBridge.socket = socket;
+  audioBridge.writable = true;
+
+  socket.once('connect', () => {
+    audioBridge.reconnectDelay = AUDIO_RECONNECT_MIN_MS;
+    setAudioState('connected');
+  });
+
+  // Backpressure: sobald write() Rückstau meldet, wird bis zum drain-
+  // Event nicht weitergeschrieben (writeAudioChunk verwirft in der
+  // Zwischenzeit neue Blöcke, statt sie zu puffern).
+  socket.on('drain', () => {
+    audioBridge.writable = true;
+  });
+
+  socket.once('error', () => {
+    // Aufräumen übernimmt das nachfolgende 'close'-Event.
+  });
+
+  socket.once('close', () => {
+    if (audioBridge.socket === socket) audioBridge.socket = null;
+    audioBridge.writable = false;
+    if (audioBridge.wantConnected) {
+      setAudioState('error', 'Verbindung zum Audio-Port (7655) getrennt, versuche erneut…');
+      scheduleAudioReconnect();
+    }
+  });
+
+  socket.connect(AUDIO_PORT, AUDIO_HOST);
+}
+
+function startAudioBridge() {
+  if (audioBridge.wantConnected) return;
+  audioBridge.wantConnected = true;
+  audioBridge.reconnectDelay = AUDIO_RECONNECT_MIN_MS;
+  connectAudioBridge();
+}
+
+function stopAudioBridge() {
+  audioBridge.wantConnected = false;
+  if (audioBridge.reconnectTimer) {
+    clearTimeout(audioBridge.reconnectTimer);
+    audioBridge.reconnectTimer = null;
+  }
+  audioBridge.reconnectDelay = AUDIO_RECONNECT_MIN_MS;
+  if (audioBridge.socket) {
+    const s = audioBridge.socket;
+    audioBridge.socket = null;
+    s.removeAllListeners();
+    s.destroy();
+  }
+  audioBridge.writable = false;
+  setAudioState('disconnected');
+}
+
+/** Stellt den gewünschten Zustand der Audio-Bridge her (an, wenn Sidecar läuft/adoptiert ist UND audioEnabled). */
+function syncAudioBridgeWanted() {
+  const shouldRun = (sidecar.child !== null || sidecar.adopted) && settings.audioEnabled === true;
+  if (shouldRun) startAudioBridge();
+  else stopAudioBridge();
+}
+
+/**
+ * Schreibt einen PCM-Block auf den Audio-Socket. Ohne Verbindung wird
+ * still verworfen. Bei Rückstau (letztes write() lieferte false) wird
+ * dieser Block ebenfalls verworfen statt gepuffert - ein Ton, der
+ * Sekunden hinterherhinkt, ist wertloser als eine kurze Lücke.
+ */
+function writeAudioChunk(buffer) {
+  const socket = audioBridge.socket;
+  if (!socket || socket.destroyed || !audioBridge.writable) return;
+  const ok = socket.write(buffer);
+  if (!ok) audioBridge.writable = false;
+}
+
+// ---------------------------------------------------------------------------
 // Sidecar-Prozessverwaltung
 // ---------------------------------------------------------------------------
 
@@ -247,7 +375,13 @@ function resolveSidecarPath() {
 }
 
 function buildSidecarArgs(s) {
-  const args = ['-daemonize', '-no-audio', '-fps', String(s.fps), '-output-index', String(s.outputIndex)];
+  const args = ['-daemonize'];
+  if (s.audioEnabled) {
+    args.push('-audio-tcp', String(AUDIO_PORT));
+  } else {
+    args.push('-no-audio');
+  }
+  args.push('-fps', String(s.fps), '-output-index', String(s.outputIndex));
   args.push('-max-height', String(s.maxHeight));
   if (s.bitrate && s.bitrate > 0) {
     args.push('-bitrate', String(s.bitrate));
@@ -350,12 +484,14 @@ async function startOrAdoptSidecar(currentSettings) {
     await sendControlCommand({ cmd: 'status' }, 800);
     sidecar.adopted = true;
     console.log('[sidecar] Bestehender Daemon auf Port 7654 gefunden, wird verwendet (nicht von der GUI gestartet).');
+    syncAudioBridgeWanted();
     return;
   } catch (probeErr) {
     // Niemand antwortet - selbst starten.
   }
 
   await spawnSidecarProcess(currentSettings);
+  syncAudioBridgeWanted();
 }
 
 /**
@@ -364,6 +500,11 @@ async function startOrAdoptSidecar(currentSettings) {
  * Neustart wegen geänderter Einstellungen verwendet.
  */
 async function stopSidecarClean() {
+  // Audio-Bridge unabhängig vom Prozess-Ownership-Status immer mit
+  // abbauen - sie ist eine separate, von der GUI selbst gehaltene
+  // TCP-Verbindung und darf den Sidecar nicht überleben.
+  stopAudioBridge();
+
   if (!sidecar.child && !sidecar.adopted) return;
 
   try {
@@ -449,6 +590,44 @@ async function ensureSidecarRunning() {
     return;
   }
   await startOrAdoptSidecar(settings);
+}
+
+// ---------------------------------------------------------------------------
+// Loopback-Audioerfassung (System-Audio, Windows-only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Registriert den Handler für navigator.mediaDevices.getDisplayMedia() im
+ * Renderer. audio: 'loopback' ist laut Electron-Dokumentation der einzige
+ * offiziell unterstützte Weg an System-Audio zu kommen und nur unter
+ * Windows verfügbar - passt hier. bewusst NICHT verwendet wird
+ * getUserMedia({ chromeMediaSource: 'desktop' }) für Audio: das killt den
+ * Renderer mit "Terminating renderer for bad IPC message, reason 263"
+ * (electron#42765, als "not planned" geschlossen).
+ *
+ * Der Video-Track wird nur benötigt, um den Audio-Track zu bekommen (das
+ * eigentliche Bild liefert der Go-Sidecar per ffmpeg) - er wird im
+ * Renderer direkt nach getDisplayMedia() wieder gestoppt.
+ */
+function registerDisplayMediaHandler() {
+  session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+    desktopCapturer
+      .getSources({ types: ['screen'] })
+      .then((sources) => {
+        if (!sources || sources.length === 0) {
+          // Kein Bildschirm gefunden - Anfrage sauber ablehnen statt in
+          // einen TypeError beim Zugriff auf sources[0] zu laufen.
+          console.error('[audio] desktopCapturer.getSources() lieferte keine Quellen.');
+          callback({});
+          return;
+        }
+        callback({ video: sources[0], audio: 'loopback' });
+      })
+      .catch((err) => {
+        console.error('[audio] getSources() für Loopback-Anfrage fehlgeschlagen:', err.message);
+        callback({});
+      });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +845,17 @@ function registerIpcHandlers() {
     return err;
   });
 
+  /**
+   * Pull-Fallback für den aktuellen Audio-Bridge-Zustand: analog zum
+   * lastSidecarError-Problem kann der 'audio:status'-Push verloren gehen,
+   * wenn der Renderer seinen Event-Listener noch nicht registriert hat
+   * (z.B. weil startOrAdoptSidecar() gleich nach app.whenReady() schon
+   * die erste Verbindung zu 7655 aufbaut, bevor die Seite fertig geladen
+   * ist). Der Renderer fragt diesen Zustand daher beim Start zusätzlich
+   * aktiv ab, statt sich allein auf den Push zu verlassen.
+   */
+  ipcMain.handle('audio:statusGet', async () => ({ state: audioBridge.state }));
+
   ipcMain.handle('settings:get', async () => {
     return settings;
   });
@@ -678,10 +868,26 @@ function registerIpcHandlers() {
 
     try {
       const { restarted, note } = await applySettingsRestartIfNeeded(oldSettings, newSettings);
+      // Deckt sowohl den Fall ab, dass audioEnabled sich geändert hat (dann
+      // hat applySettingsRestartIfNeeded gerade neu gestartet) als auch den
+      // Fall eines adoptierten Fremd-Daemons (der nicht neu startet, dessen
+      // Audio-Port aber trotzdem verbunden/getrennt werden soll).
+      syncAudioBridgeWanted();
       return { ok: true, settings, restarted, note };
     } catch (err) {
       return { ok: false, settings, error: `Neustart des Sidecars fehlgeschlagen: ${err.message}` };
     }
+  });
+
+  // Fire-and-forget: der Renderer schickt hier alle ~10-20ms einen PCM-
+  // Block (ArrayBuffer, s16le/44100Hz/stereo, aus dem AudioWorklet). Ein
+  // invoke()-Roundtrip wäre für diese Frequenz unnötig teuer.
+  ipcMain.on('audio:chunk', (_event, payload) => {
+    if (!(payload instanceof ArrayBuffer)) return;
+    // Plausibilitätsdeckel: bei 20ms Batches sind das ~3528 Byte; alles
+    // jenseits von 64 KiB ist mit Sicherheit keine gültige Nachricht.
+    if (payload.byteLength === 0 || payload.byteLength > 65536) return;
+    writeAudioChunk(Buffer.from(payload));
   });
 }
 
@@ -714,6 +920,7 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     loadSettings();
     registerIpcHandlers();
+    registerDisplayMediaHandler();
     createWindow();
 
     screen.on('display-added', broadcastDisplays);

@@ -3,7 +3,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 // Nur diese Kanäle dürfen per on() abonniert werden (Push vom Main-Prozess).
-const ALLOWED_EVENTS = ['mirror:status', 'display:list', 'sidecar:error', 'device:updated'];
+const ALLOWED_EVENTS = ['mirror:status', 'display:list', 'sidecar:error', 'device:updated', 'audio:status'];
 
 function on(channel, callback) {
   if (!ALLOWED_EVENTS.includes(channel)) {
@@ -33,6 +33,13 @@ contextBridge.exposeInMainWorld('luftspiegel', {
   },
   sidecar: {
     lastError: () => ipcRenderer.invoke('sidecar:lastError'),
+  },
+  audio: {
+    // Fire-and-forget: PCM-Block (ArrayBuffer) aus dem AudioWorklet an den
+    // Main-Prozess weiterreichen, der ihn auf den TCP-Socket schreibt.
+    sendChunk: (arrayBuffer) => ipcRenderer.send('audio:chunk', arrayBuffer),
+    // Pull-Fallback für den aktuellen Bridge-Zustand (siehe main.js).
+    status: () => ipcRenderer.invoke('audio:statusGet'),
   },
   on,
 });

@@ -10,12 +10,20 @@ import (
 	"io"
 	"net"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
 	aeadchacha20poly1305 "github.com/aead/chacha20poly1305"
 )
+
+// DefaultAudioTCPPort is the default local TCP port the Windows audio backend
+// (audio_windows.go) listens on for the raw-PCM audio source pushed by an
+// external WASAPI-loopback-capture process (e.g. doubletake's companion
+// Electron GUI). Declared here (unguarded) rather than in audio_windows.go so
+// cmd/doubletake and internal/daemon, which build on every platform, can use
+// it as their flag/config default without a per-platform default literal.
+// Unused on Linux, which has no TCP audio source.
+const DefaultAudioTCPPort = 7655
 
 // AudioCodec identifies the codec used for audio streaming.
 type AudioCodec int
@@ -83,81 +91,28 @@ func randomRTPTime(reader io.Reader) (uint32, error) {
 	return binary.BigEndian.Uint32(value[:]), nil
 }
 
-// AudioCapture manages audio capture via GStreamer and local ALAC encoding.
+// AudioCapture manages the platform-specific raw PCM audio source and feeds
+// it through the built-in ALAC verbatim encoder (see encodeALACVerbatim
+// below, which is shared and unchanged across platforms). StartAudioCapture
+// is the single entry point; its two implementations live in audio_linux.go
+// (a GStreamer pulsesrc/pipewiresrc pipeline reading the desktop's monitor
+// device) and audio_windows.go (a local TCP listener fed by an external
+// process doing WASAPI loopback capture, e.g. the Electron GUI). Both
+// backends populate the same generic fields below — this mirrors how
+// ScreenCapture in capture.go is shared between capture_linux.go and
+// capture_windows.go.
 type AudioCapture struct {
-	gstCmd  *exec.Cmd
-	pcmPipe io.ReadCloser
+	cmd     *exec.Cmd     // capture process (gst-launch-1.0 on Linux); nil on Windows
+	pcmPipe io.ReadCloser // continuous PCM source (44.1kHz stereo S16LE)
 	cancel  context.CancelFunc
-	waitCh  chan struct{}
-	waitErr error
+	waitCh  chan struct{} // closed when capture is done (process exited, or ctx canceled)
+	waitErr error         // set before waitCh is closed
 	stopped bool
-}
 
-// StartAudioCapture launches a pipeline that captures system audio (monitor source)
-// and feeds raw PCM into the built-in ALAC encoder.
-func StartAudioCapture(ctx context.Context, testTone bool) (*AudioCapture, error) {
-	captureCtx, cancel := context.WithCancel(ctx)
-
-	// Detect audio source
-	var srcArgs []string
-	if testTone {
-		srcArgs = []string{"audiotestsrc", "wave=sine", "freq=440", "is-live=true",
-			"samplesperbuffer=352"}
-		dbg("[AUDIO] using test tone (440 Hz sine wave, live, spf=352)")
-	} else if exec.Command("gst-inspect-1.0", "pulsesrc").Run() == nil {
-		monitor := detectPulseMonitor()
-		if monitor == "" {
-			cancel()
-			return nil, fmt.Errorf("no PulseAudio monitor source found")
-		}
-		srcArgs = []string{"pulsesrc", fmt.Sprintf("device=%s", monitor)}
-		dbg("[AUDIO] using pulsesrc device=%s", monitor)
-	} else if exec.Command("gst-inspect-1.0", "pipewiresrc").Run() == nil {
-		srcArgs = []string{"pipewiresrc"}
-		dbg("[AUDIO] using pipewiresrc")
-	} else {
-		cancel()
-		return nil, fmt.Errorf("no audio source available (need pulsesrc or pipewiresrc)")
-	}
-
-	ac := &AudioCapture{
-		cancel: cancel,
-		waitCh: make(chan struct{}),
-	}
-
-	gstArgs := []string{"--quiet"}
-	gstArgs = append(gstArgs, srcArgs...)
-	gstArgs = append(gstArgs,
-		"!", "audioconvert",
-		"!", "audioresample",
-		"!", "audio/x-raw,rate=44100,channels=2,format=S16LE",
-		"!", "queue", "max-size-buffers=2", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
-		"!", "fdsink", "fd=1", "sync=false", "async=false",
-	)
-	dbg("[AUDIO] ALAC verbatim pipeline: gst-launch-1.0 %s", strings.Join(gstArgs, " "))
-
-	gstCmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
-	gstStdout, err := gstCmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("gst stdout pipe: %w", err)
-	}
-	gstStderr, _ := gstCmd.StderrPipe()
-
-	if err := gstCmd.Start(); err != nil {
-		cancel()
-		return nil, fmt.Errorf("start ALAC gst pipeline: %w", err)
-	}
-	go logStderr("AUDIO-GST", gstStderr)
-
-	ac.gstCmd = gstCmd
-	ac.pcmPipe = gstStdout
-	go func() {
-		ac.waitErr = gstCmd.Wait()
-		close(ac.waitCh)
-	}()
-
-	return ac, nil
+	// extraStop, if set, runs during Stop() for backend-specific cleanup beyond
+	// cancel/pcmPipe.Close/cmd.Kill — e.g. closing the Windows TCP listener and
+	// any accepted connection.
+	extraStop func()
 }
 
 // ReadFrame reads a single ALAC-encoded audio frame.
@@ -235,14 +190,17 @@ func (ac *AudioCapture) Stop() {
 	if ac.pcmPipe != nil {
 		ac.pcmPipe.Close()
 	}
-	if ac.gstCmd != nil && ac.gstCmd.Process != nil {
-		ac.gstCmd.Process.Kill()
+	if ac.extraStop != nil {
+		ac.extraStop()
+	}
+	if ac.cmd != nil && ac.cmd.Process != nil {
+		ac.cmd.Process.Kill()
 	}
 	select {
 	case <-ac.waitCh:
 	case <-time.After(2 * time.Second):
-		if ac.gstCmd != nil && ac.gstCmd.Process != nil {
-			ac.gstCmd.Process.Kill()
+		if ac.cmd != nil && ac.cmd.Process != nil {
+			ac.cmd.Process.Kill()
 		}
 		<-ac.waitCh
 	}
@@ -347,20 +305,6 @@ func (w *bitWriter) flush() int {
 		w.pos++
 	}
 	return w.pos
-}
-
-// detectPulseMonitor finds the default PulseAudio sink's monitor source name.
-func detectPulseMonitor() string {
-	out, err := exec.Command("pactl", "get-default-sink").Output()
-	if err != nil {
-		dbg("[AUDIO] pactl get-default-sink failed: %v", err)
-		return ""
-	}
-	sinkName := strings.TrimSpace(string(out))
-	if sinkName == "" {
-		return ""
-	}
-	return sinkName + ".monitor"
 }
 
 // AudioStream manages the RTP audio channel to the AirPlay receiver.
