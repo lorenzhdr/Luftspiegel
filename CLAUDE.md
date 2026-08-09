@@ -441,6 +441,10 @@ Zuletzt bestätigt am **2026-08-10** mit den 2.0-Binaries (CLI-Pfad, ohne GUI):
   eigentliche Beweis, dass das RTSP-TEARDOWN sauber durchlief.
 - `status`-Abfragen während eines laufenden Teardowns antworteten in **12–30 ms** (vor dem 2.0-Fix hielt
   der Teardown `d.mu` und blockierte den Steuerkanal).
+- **Drei** Connect/Disconnect-Zyklen hintereinander: `has_audio` blieb jedes Mal `true` und der Daemon
+  loggte jedes Mal „audio capture started", nie „audio already bound". Der `audioOwner`-Slot wird also
+  beim Trennen wirklich freigegeben und beim nächsten Verbinden neu belegt — sonst wäre jeder Stream nach
+  dem ersten dauerhaft auf `audioSuppressed` hängengeblieben.
 - Keine verwaisten `luftspiegel.exe`- oder `ffmpeg.exe`-Prozesse nach dem Beenden.
 
 **Nicht** gegen echte Hardware verifiziert ist der Fall „Empfänger verschwindet mitten im Stream" (dafür
@@ -454,6 +458,11 @@ müsste das Apple TV im Betrieb vom Netz) — dieser Pfad ist nur durch
   (`gui/package.json`). Bewusst in Kauf genommen, bis auf eine neuere Electron-Version aktualisiert wird.
 - **Praktische Bedienabnahme der GUI durch den Nutzer steht aus** (über die Low-Level-Verifikation von
   Pairing/Mirroring/Audio hinaus).
+- **Installer nur gebaut, nicht installiert.** `npm run build` erzeugt `Luftspiegel Setup 2.0.0.exe`
+  (141,7 MB, NSIS, win/arm64) mit Exit-Code 0, und das gebundelte `resources/luftspiegel.exe` ist per
+  SHA256 identisch mit dem frisch gebauten `bin/luftspiegel.exe`. **Nicht** geprüft sind die Installation
+  selbst und der Start der installierten App — dafür müsste man das Paket wirklich installieren. Der
+  Installer ist außerdem **nicht signiert**, Windows SmartScreen warnt entsprechend.
 - **Ende-zu-Ende-Latenz ist weiterhin nur bis zum Socket gemessen.** Der Idle-Flush ist gegen echte
   Hardware bestätigt (2026-08-10, `AppleTV11,1`: `au hold` p50 **9,7–10,1 ms**, p95 ~12 ms — vorher lag
   ein voller Frame-Hold von ~33 ms an), ebenso `rtt` (~15 ms) und die vom Receiver gemeldete
