@@ -43,6 +43,12 @@ let streams = [];
 // Merkt sich, welche IPs bereits eine PIN eingegeben haben (simuliert
 // den needs_pin-Fall nur beim ersten Verbindungsversuch je Ziel).
 const pinConfirmed = new Set();
+// Ziel, das gerade auf eine PIN-Eingabe wartet. Der echte Go-Daemon meldet in
+// diesem Zustand auch auf ein normales 'status' den State 'pin_required'
+// (StatePINRequired, internal/daemon/daemon.go) - der fake-daemon bildet das
+// nach, damit der Statuspoll der GUI diesen State ueberhaupt zu sehen bekommt
+// und ui-check.js die classifyStatus()-Behandlung pruefen kann.
+let pendingPinTarget = null;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -128,7 +134,7 @@ function baseResponse(extra) {
   return Object.assign(
     {
       ok: true,
-      state: streams.length ? streams[streams.length - 1].state : 'getrennt',
+      state: pendingPinTarget ? 'pin_required' : streams.length ? streams[streams.length - 1].state : 'idle',
       device: streams.length ? streams[streams.length - 1].device : '',
       device_ip: streams.length ? streams[streams.length - 1].device_ip : '',
       has_audio: false,
@@ -175,12 +181,14 @@ function handleCommand(cmd) {
       // ersten Verbindungsversuch eine PIN.
       if (target === '192.168.178.200' && !pinConfirmed.has(target)) {
         if (!cmd.pin) {
-          return baseResponse({ needs_pin: true, state: 'wartet auf pin', device: dev.name, device_ip: target });
+          pendingPinTarget = target;
+          return baseResponse({ needs_pin: true, state: 'pin_required', device: dev.name, device_ip: target });
         }
         if (cmd.pin !== '1234') {
           return { ok: false, error: 'Falsche PIN.', needs_pin: true, devices: FAKE_DEVICES, streams };
         }
         pinConfirmed.add(target);
+        pendingPinTarget = null;
       }
 
       // Simuliert: unbekannte/nicht erreichbare IP schlägt fehl.
@@ -189,10 +197,10 @@ function handleCommand(cmd) {
       }
 
       streams = streams.filter((s) => s.device_ip !== target);
-      streams.push({ device: dev.name || target, device_ip: target, state: 'verbunden', has_audio: false, audio_muted: false });
+      streams.push({ device: dev.name || target, device_ip: target, state: 'streaming', has_audio: false, audio_muted: false });
       startStatsSimulation();
 
-      return baseResponse({ state: 'verbunden', device: dev.name || target, device_ip: target });
+      return baseResponse({ state: 'streaming', device: dev.name || target, device_ip: target });
     }
 
     case 'disconnect': {
@@ -202,7 +210,8 @@ function handleCommand(cmd) {
         streams = [];
       }
       if (streams.length === 0) stopStatsSimulation();
-      return baseResponse({ state: 'getrennt', device: '', device_ip: '' });
+      if (!cmd.target || cmd.target === pendingPinTarget) pendingPinTarget = null;
+      return baseResponse({ state: 'idle', device: '', device_ip: '' });
     }
 
     case 'mute': {

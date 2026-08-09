@@ -224,7 +224,12 @@
     let bucket = 'disconnected';
     if (/(idle|disconnect|getrennt|none)/.test(low) || low === '') {
       bucket = 'disconnected';
-    } else if (/(pair|verbinde|connecting|handshake|discov)/.test(low)) {
+      // "pin" deckt den echten Daemon-State "pin_required" ab (siehe
+      // StatePINRequired in internal/daemon/daemon.go). Ohne ihn fiel eine
+      // laufende Kopplung durch alle Regexe in den Default-Bucket
+      // "disconnected" - graue Pille und deaktivierter Stop-Button, während
+      // der Nutzer gerade seine PIN eintippt.
+    } else if (/(pair|pin|verbinde|connecting|handshake|discov)/.test(low)) {
       bucket = 'connecting';
     } else if (/(stream|mirror|verbunden|connected|active|running)/.test(low)) {
       bucket = 'connected';
@@ -356,36 +361,50 @@
     const stepX = n > 1 ? w / (n - 1) : w;
     const padY = 3; // etwas Luft oben/unten, damit die Linie nicht am Rand klebt
 
-    ctx.beginPath();
-    let started = false;
+    // In zusammenhängende Segmente zerlegen: eine Lücke (fehlender Slot)
+    // trennt zwei Segmente. Ein Nullwert ist KEINE Lücke, sondern ein echter
+    // Messwert (= in diesen 500ms wurde kein Frame gesendet, also ein Stall)
+    // und bleibt Teil seines Segments - siehe die history-Semantik in
+    // internal/airplay/stats.go.
+    const segments = [];
+    let current = null;
     indexed.forEach((p) => {
       if (!p) {
-        started = false; // Lücke (fehlender Slot): nächster gültiger Punkt beginnt einen neuen Linienabschnitt
+        current = null;
         return;
       }
-      const x = p.i * stepX;
-      const y = h - padY - (p.v / scaleMax) * (h - padY * 2);
-      if (!started) {
-        ctx.moveTo(x, y);
-        started = true;
+      const pt = { x: p.i * stepX, y: h - padY - (p.v / scaleMax) * (h - padY * 2) };
+      if (!current) {
+        current = [pt];
+        segments.push(current);
       } else {
-        ctx.lineTo(x, y);
+        current.push(pt);
       }
     });
+
+    // Fläche zuerst und PRO SEGMENT als eigener Pfad. Vorher lief alles in
+    // einem einzigen Pfad: closePath() schließt aber nur den letzten
+    // Subpfad, die übrigen wurden von fill() implizit geschlossen und als
+    // eigene Polygone über den Lücken gefüllt.
+    ctx.fillStyle = fillColor;
+    segments.forEach((seg) => {
+      if (seg.length < 2) return; // eine einzelne Stütze hat keine Fläche
+      ctx.beginPath();
+      ctx.moveTo(seg[0].x, h);
+      seg.forEach((pt) => ctx.lineTo(pt.x, pt.y));
+      ctx.lineTo(seg[seg.length - 1].x, h);
+      ctx.closePath();
+      ctx.fill();
+    });
+
     ctx.strokeStyle = color;
     ctx.lineWidth = 1.5;
     ctx.lineJoin = 'round';
-    ctx.stroke();
-
-    // Fläche unter der Kurve, leicht gefüllt - nur über den zusammenhängend
-    // gültigen Bereich vom ersten bis zum letzten echten Messpunkt.
-    const first = valid[0];
-    const last = valid[valid.length - 1];
-    ctx.lineTo(last.i * stepX, h);
-    ctx.lineTo(first.i * stepX, h);
-    ctx.closePath();
-    ctx.fillStyle = fillColor;
-    ctx.fill();
+    segments.forEach((seg) => {
+      ctx.beginPath();
+      seg.forEach((pt, i) => (i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y)));
+      ctx.stroke();
+    });
 
     return max;
   }
@@ -435,8 +454,15 @@
     // Truthy prüfen, sonst würde "max 0" fälschlich als leer behandelt.
     const history = Array.isArray(s.history) ? s.history : [];
     const bitrateMax = drawSparkline(el.sparkBitrate, history.map((h) => h && h.bitrate_kbps), accent, fill);
+    // Durch 1000 teilen darf NUR der Mbit/s-Zweig: vorher lief die Division
+    // auch im kbit/s-Fall, sodass 800 kbit/s als "max 1 kbit/s" und 400 als
+    // "max 0 kbit/s" angezeigt wurden.
     el.sparkBitrateMax.textContent =
-      bitrateMax !== null ? `max ${(bitrateMax / 1000).toFixed(bitrateMax >= 1000 ? 2 : 0)} ${bitrateMax >= 1000 ? 'Mbit/s' : 'kbit/s'}` : '';
+      bitrateMax !== null
+        ? bitrateMax >= 1000
+          ? `max ${(bitrateMax / 1000).toFixed(2)} Mbit/s`
+          : `max ${bitrateMax.toFixed(0)} kbit/s`
+        : '';
     const auHoldMax = drawSparkline(el.sparkAuHold, history.map((h) => h && h.au_hold_ms), accent, fill);
     el.sparkAuHoldMax.textContent = auHoldMax !== null ? `max ${auHoldMax.toFixed(1)} ms` : '';
     const fpsMax = drawSparkline(el.sparkFps, history.map((h) => h && h.fps), accent, fill);
@@ -790,12 +816,23 @@
   }
 
   /** Zeigt/verbirgt und beschriftet die Ton-Statuspille (Zustand kommt vom Main-Prozess, also der TCP-Bridge zu Port 7655). */
+  // Letzter echter Audio-Bridge-Zustand. Nötig, weil main.js setAudioState()
+  // nur bei Zustands*wechseln* pusht: ein Aufruf von updateAudioPill(null)
+  // (nur Sichtbarkeit umschalten, z.B. nach fillSettingsForm()) hat vorher
+  // hart auf 'disconnected' zurückgesetzt, und weil danach kein Push mehr
+  // kam, blieb die Pille dauerhaft auf "Ton: aus" stehen, obwohl die Bridge
+  // verbunden war. Jetzt bedeutet null "unverändert neu zeichnen".
+  let lastAudioStatus = null;
+
   function updateAudioPill(payload) {
+    if (payload) lastAudioStatus = payload;
+    const effective = payload || lastAudioStatus;
+
     const enabled = !!(currentSettings && currentSettings.audioEnabled);
     el.audioPill.classList.toggle('hidden', !enabled);
     if (!enabled) return;
 
-    const state = (payload && payload.state) || 'disconnected';
+    const state = (effective && effective.state) || 'disconnected';
     const labels = {
       disconnected: 'Ton: aus',
       connecting: 'Ton: verbinde…',
@@ -804,9 +841,9 @@
     };
     el.audioPill.dataset.state = state;
     el.audioLabel.textContent = labels[state] || 'Ton: unbekannt';
-    el.audioPill.title = (payload && payload.detail) || '';
-    if (payload && typeof payload.droppedChunks === 'number') {
-      guiAudioDropped = payload.droppedChunks;
+    el.audioPill.title = (effective && effective.detail) || '';
+    if (effective && typeof effective.droppedChunks === 'number') {
+      guiAudioDropped = effective.droppedChunks;
     }
   }
 
@@ -883,6 +920,45 @@
    * lastDevice) bei jeder Formular-Änderung auf ihren Default zurückfallen,
    * weil settings:set das Settings-Objekt komplett ersetzt (main.js).
    */
+  /**
+   * Liest ein Zahlenfeld, behält aber bei leerem/ungültigem Inhalt den
+   * bisherigen Wert. Vorher stand hier `Number(el.x.value) || 0`: leert der
+   * Nutzer das Feld (auch nur kurz beim Tippen), ging eine 0 an den Main-
+   * Prozess, sanitizeIntInRange() klemmte sie auf das MINIMUM des jeweiligen
+   * Bereichs - und weil diese Felder in daemonFlagsChanged() stehen, startete
+   * der Sidecar sofort mit einem Wert neu, den niemand gewählt hat.
+   */
+  function numFieldOrKeep(input, key, fallback) {
+    const raw = (input.value || '').trim();
+    if (raw === '') {
+      const prev = currentSettings ? currentSettings[key] : undefined;
+      return Number.isFinite(prev) ? prev : fallback;
+    }
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+      const prev = currentSettings ? currentSettings[key] : undefined;
+      return Number.isFinite(prev) ? prev : fallback;
+    }
+    return parsed;
+  }
+
+  /**
+   * Monitorauswahl: nur übernehmen, wenn die Auswahl auch wirklich existiert.
+   * renderDisplays() setzt select.value auf currentSettings.outputIndex; ist
+   * diese Option nicht (mehr) vorhanden - Monitor abgezogen, oder das
+   * Formular wurde vor api.displays.list() befüllt - bleibt value leer, und
+   * ein `Number(value) || 0` hätte die Auswahl still auf den Hauptmonitor
+   * zurückgesetzt UND einen Sidecar-Neustart ausgelöst.
+   */
+  function outputIndexFromForm() {
+    const prev = currentSettings && Number.isFinite(currentSettings.outputIndex) ? currentSettings.outputIndex : 0;
+    if (!el.monitorSelect.options.length) return prev;
+    const raw = (el.monitorSelect.value || '').trim();
+    if (raw === '') return prev;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : prev;
+  }
+
   function readSettingsFromForm() {
     const checked = el.fpsField.querySelector('input[name="fps"]:checked');
     return {
@@ -890,17 +966,17 @@
       fps: checked ? Number(checked.value) : 30,
       maxHeight: Number(el.maxHeight.value),
       bitrate: Number(el.bitrate.value) || 0,
-      outputIndex: Number(el.monitorSelect.value) || 0,
+      outputIndex: outputIndexFromForm(),
       audioEnabled: !!el.audioToggle.checked,
 
       preset: el.presetSelect.value,
       expertMode: !!el.expertMode.checked,
 
-      targetLatencyMs: Number(el.targetLatencyMs.value) || 0,
-      gopSeconds: Number(el.gopSeconds.value) || 0,
+      targetLatencyMs: numFieldOrKeep(el.targetLatencyMs, 'targetLatencyMs', 100),
+      gopSeconds: numFieldOrKeep(el.gopSeconds, 'gopSeconds', 4),
       rateControl: el.rateControl.value,
       hwaccel: el.hwaccel.value,
-      audioBufferMs: Number(el.audioBufferMs.value) || 0,
+      audioBufferMs: numFieldOrKeep(el.audioBufferMs, 'audioBufferMs', 120),
 
       showCursor: !!el.showCursor.checked,
 
@@ -919,6 +995,13 @@
       const resp = await api.settings.set(newSettings);
       if (!resp || resp.ok === false) {
         showSidecarNoticeQuiet(null);
+        // Auch im Fehlerfall den vom Main-Prozess zurückgemeldeten Stand
+        // übernehmen: persistSettings() dort hat längst geschrieben, nur der
+        // Sidecar-Neustart ist gescheitert. Ohne das divergieren Main und
+        // Renderer, und die nächste Formularänderung spreadet den veralteten
+        // currentSettings-Stand - macht also die gerade übernommene
+        // Änderung wieder rückgängig.
+        if (resp && resp.settings) currentSettings = resp.settings;
         showError((resp && resp.error) || 'Einstellungen konnten nicht übernommen werden.');
         return;
       }

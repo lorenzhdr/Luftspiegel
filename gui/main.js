@@ -82,7 +82,15 @@ let mainWindow = null;
 let statusPollTimer = null; // setTimeout-Kette (dynamisches Intervall, siehe startStatusPolling)
 let statusPollActive = false;
 let statusPollInFlight = false; // Overlap-Schutz: ein Tick wird übersprungen, solange der vorige noch offen ist
+// Generationszähler gegen doppelte Timer-Ketten: stopStatusPolling() kann
+// einen bereits laufenden (mid-await) Tick nicht per clearTimeout() stoppen,
+// weil dessen Timer schon gefeuert hat. Jeder Tick trägt die Epoche, unter
+// der er geplant wurde, und bricht ab (statt sich selbst nachzuplanen),
+// sobald sie nicht mehr mit statusPollEpoch übereinstimmt - siehe
+// startStatusPolling()/stopStatusPolling().
+let statusPollEpoch = 0;
 let devicesPollTimer = null; // eigener setInterval, entkoppelt vom status-Poll
+let devicesPollInFlight = false; // Overlap-Schutz, analog zu statusPollInFlight
 let settings = { ...DEFAULT_SETTINGS };
 let lastSidecarError = null;
 let tray = null;
@@ -331,6 +339,12 @@ function sendControlCommand(cmdObj, timeoutMs = DEFAULT_TIMEOUT_MS) {
       if (settled) return;
       settled = true;
       socket.removeAllListeners();
+      // Ein verspätetes ECONNRESET/EPIPE auf dem gerade zerstörten Socket
+      // (z.B. ein noch nicht vollständig geflushter write()) würde sonst
+      // ohne 'error'-Listener als uncaught exception den gesamten
+      // Electron-Main-Prozess mitreißen - Rückstands-Fehler nach destroy()
+      // sind hier irrelevant und werden bewusst verschluckt.
+      socket.on('error', () => {});
       socket.destroy();
       if (err) reject(err);
       else resolve(result);
@@ -458,6 +472,9 @@ function stopAudioBridge() {
     const s = audioBridge.socket;
     audioBridge.socket = null;
     s.removeAllListeners();
+    // Siehe sendControlCommand(): ohne diesen No-op-Handler kann ein
+    // verspätetes 'error' nach destroy() den Main-Prozess killen.
+    s.on('error', () => {});
     s.destroy();
   }
   audioBridge.writable = false;
@@ -634,21 +651,44 @@ async function spawnSidecarProcess(currentSettings) {
  * Implementierungen testbar. Nur wenn niemand antwortet, startet die GUI
  * ihren eigenen Sidecar-Prozess.
  */
+/**
+ * Gemerkte Promise eines laufenden startOrAdoptSidecar()-Aufrufs. app.
+ * whenReady() und der device:discover-IPC aus dem Renderer-init() rufen
+ * praktisch immer gleichzeitig ensureSidecarRunning()/startOrAdoptSidecar()
+ * auf - ohne diesen Cache passieren beide den simplen
+ * "sidecar.child || sidecar.adopted"-Check, bevor die ~800ms-Probe
+ * überhaupt geantwortet hat, und der zweite Aufrufer landet in
+ * spawnSidecarProcess()s "Sidecar läuft bereits."-Fehler, obwohl alles
+ * funktioniert. Alle Aufrufer, die auf einen bereits laufenden Start
+ * treffen, bekommen stattdessen dieselbe Promise zurück.
+ */
+let sidecarStartupPromise = null;
+
 async function startOrAdoptSidecar(currentSettings) {
   if (sidecar.child || sidecar.adopted) return;
+  if (sidecarStartupPromise) return sidecarStartupPromise;
 
-  try {
-    await sendControlCommand({ cmd: 'status' }, 800);
-    sidecar.adopted = true;
-    console.log('[sidecar] Bestehender Daemon auf Port 7654 gefunden, wird verwendet (nicht von der GUI gestartet).');
+  sidecarStartupPromise = (async () => {
+    try {
+      await sendControlCommand({ cmd: 'status' }, 800);
+      sidecar.adopted = true;
+      console.log('[sidecar] Bestehender Daemon auf Port 7654 gefunden, wird verwendet (nicht von der GUI gestartet).');
+      syncAudioBridgeWanted();
+      return;
+    } catch (probeErr) {
+      // Niemand antwortet - selbst starten.
+    }
+
+    await spawnSidecarProcess(currentSettings);
     syncAudioBridgeWanted();
-    return;
-  } catch (probeErr) {
-    // Niemand antwortet - selbst starten.
-  }
+  })().finally(() => {
+    // Sowohl bei Erfolg als auch bei Fehler zurücksetzen, damit ein
+    // späterer, echter Neustart (z.B. nach einem Absturz) nicht für immer
+    // an dieser abgeschlossenen Promise hängen bleibt.
+    sidecarStartupPromise = null;
+  });
 
-  await spawnSidecarProcess(currentSettings);
-  syncAudioBridgeWanted();
+  return sidecarStartupPromise;
 }
 
 /**
@@ -687,14 +727,23 @@ async function stopSidecarClean() {
 
   await new Promise((resolve) => {
     let done = false;
+    let killTimer = null;
     const finish = () => {
       if (done) return;
       done = true;
+      // Aufräumen, sonst läuft der Timer nach einem sofort beendeten Kind
+      // noch 3s weiter und zeigt dann auf einen längst ersetzten Prozess
+      // (relevant beim Sidecar-Neustart wegen geänderter Einstellungen).
+      if (killTimer) {
+        clearTimeout(killTimer);
+        killTimer = null;
+      }
       resolve();
     };
     child.once('exit', finish);
     child.kill();
-    setTimeout(() => {
+    killTimer = setTimeout(() => {
+      killTimer = null;
       if (!done && sidecar.child === child) {
         try {
           child.kill('SIGKILL');
@@ -842,21 +891,21 @@ function reportSidecarError(message) {
  * statusPollInFlight-Guard: ein neuer Tick wird übersprungen, solange der
  * vorige noch offen ist, statt eine zweite Verbindung parallel aufzumachen.
  */
-function scheduleNextStatusPoll(delayMs) {
-  if (!statusPollActive) return;
-  statusPollTimer = setTimeout(statusPollTick, delayMs);
+function scheduleNextStatusPoll(delayMs, epoch) {
+  if (!statusPollActive || epoch !== statusPollEpoch) return;
+  statusPollTimer = setTimeout(() => statusPollTick(epoch), delayMs);
 }
 
-async function statusPollTick() {
+async function statusPollTick(epoch) {
   statusPollTimer = null;
-  if (!statusPollActive) return;
+  if (!statusPollActive || epoch !== statusPollEpoch) return;
 
   if (!sidecar.child && !sidecar.adopted) {
-    scheduleNextStatusPoll(STATUS_POLL_INTERVAL_IDLE_MS);
+    scheduleNextStatusPoll(STATUS_POLL_INTERVAL_IDLE_MS, epoch);
     return; // kein Sidecar erreichbar -> nichts zu pollen
   }
   if (statusPollInFlight) {
-    scheduleNextStatusPoll(STATUS_POLL_INTERVAL_IDLE_MS);
+    scheduleNextStatusPoll(STATUS_POLL_INTERVAL_IDLE_MS, epoch);
     return;
   }
 
@@ -864,6 +913,13 @@ async function statusPollTick() {
   let nextDelay = STATUS_POLL_INTERVAL_IDLE_MS;
   try {
     const result = await sendControlCommand({ cmd: 'status' }, DEFAULT_TIMEOUT_MS);
+    // Während des awaits kann stopStatusPolling()+startStatusPolling() die
+    // Epoche weitergezählt haben (z.B. Fenster-Neuerstellung über
+    // app.on('activate')) - dieser Tick gehört dann zu einer bereits
+    // abgelösten Generation und darf weder das Ergebnis pushen noch für
+    // die NEUE Generation den statusPollInFlight-Zustand oder die
+    // Zeitplanung verändern.
+    if (epoch !== statusPollEpoch) return;
     // Zähler für verworfene Audio-Chunks huckepack auf den ohnehin
     // laufenden status-Push legen (kein eigener Kanal nötig) - so kommt er
     // im selben Rhythmus wie alle anderen Live-Werte im Statistik-Tab an.
@@ -877,11 +933,12 @@ async function statusPollTick() {
       nextDelay = STATUS_POLL_INTERVAL_STREAMING_MS;
     }
   } catch (err) {
+    if (epoch !== statusPollEpoch) return;
     notifyRenderer('mirror:status', { ok: false, error: err.message, guiAudioDropped: audioBridge.droppedChunks });
   } finally {
-    statusPollInFlight = false;
+    if (epoch === statusPollEpoch) statusPollInFlight = false;
   }
-  scheduleNextStatusPoll(nextDelay);
+  scheduleNextStatusPoll(nextDelay, epoch);
 }
 
 /**
@@ -894,12 +951,19 @@ function startDevicesPolling() {
   stopDevicesPolling();
   devicesPollTimer = setInterval(async () => {
     if (!sidecar.child && !sidecar.adopted) return;
+    // Overlap-Schutz: bei einem träge antwortenden Daemon (DEFAULT_TIMEOUT_MS
+    // = 3s, Intervall 2s) würden sich sonst Ticks stapeln und mehrere
+    // parallele Verbindungen zum One-Shot-Control-Channel offen stehen.
+    if (devicesPollInFlight) return;
+    devicesPollInFlight = true;
     try {
       const devicesResult = await sendControlCommand({ cmd: 'devices' }, DEFAULT_TIMEOUT_MS);
       notifyRenderer('device:updated', devicesResult);
     } catch (err) {
       // Stiller Fehlschlag - ein Hintergrund-Refresh der Geräteliste soll
       // keine Fehlermeldung auslösen, die Liste bleibt einfach wie sie ist.
+    } finally {
+      devicesPollInFlight = false;
     }
   }, DEVICES_POLL_INTERVAL_MS);
 }
@@ -909,17 +973,25 @@ function stopDevicesPolling() {
     clearInterval(devicesPollTimer);
     devicesPollTimer = null;
   }
+  devicesPollInFlight = false;
 }
 
 function startStatusPolling() {
-  stopStatusPolling();
+  stopStatusPolling(); // zählt statusPollEpoch hoch und entwertet damit alle alten Ticks
   statusPollActive = true;
-  scheduleNextStatusPoll(0);
+  scheduleNextStatusPoll(0, statusPollEpoch);
   startDevicesPolling();
 }
 
 function stopStatusPolling() {
   statusPollActive = false;
+  // Epoche weiterzählen: ein Tick, der gerade mitten im await auf
+  // sendControlCommand() hängt, lässt sich nicht per clearTimeout() stoppen -
+  // sein Timer ist längst gefeuert. Über die Epoche erkennt er beim
+  // Zurückkommen, dass er zu einer abgelösten Generation gehört, und plant
+  // sich nicht nach. Ohne das liefen nach einem stop/start zwei Ketten
+  // parallel (dauerhaft doppelte Poll-Frequenz).
+  statusPollEpoch++;
   if (statusPollTimer) {
     clearTimeout(statusPollTimer);
     statusPollTimer = null;
@@ -1136,6 +1208,13 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('mirror:stop', async (_event, payload) => {
+    // Gleicher Idle-Kurzschluss wie in mirror:status: ohne laufenden Sidecar
+    // gibt es nichts zu trennen. Ohne diese Prüfung liefe der Aufruf in den
+    // Verbindungsfehler des Steuerkanals und die GUI zeigte ein rotes Banner
+    // für eine Aktion, die faktisch schon erledigt ist.
+    if (!sidecar.child && !sidecar.adopted) {
+      return { ok: true, state: 'getrennt' };
+    }
     const p = payload && typeof payload === 'object' ? payload : {};
     const cmd = { cmd: 'disconnect' };
     if (typeof p.target === 'string' && p.target.trim()) {
@@ -1252,6 +1331,33 @@ async function cleanShutdown() {
   } catch (err) {
     console.error('[shutdown] Fehler beim sauberen Beenden des Sidecars:', err);
   }
+  await closeLogStream();
+}
+
+/**
+ * Schließt den Sidecar-Logstream und wartet, bis der Puffer wirklich auf
+ * der Platte ist. Ohne das verwirft das direkt folgende app.exit(0) genau
+ * die Zeilen, die man im Fehlerfall braucht - die aus dem Shutdown selbst.
+ * Der Timeout ist die Notbremse: ein hängender Stream darf das Beenden
+ * nicht blockieren, denn app.on('before-quit') ist der einzige Exit-Pfad.
+ */
+function closeLogStream() {
+  const stream = logStream;
+  logStream = null;
+  if (!stream) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const timer = setTimeout(finish, 1000);
+    stream.end(() => {
+      clearTimeout(timer);
+      finish();
+    });
+  });
 }
 
 const gotLock = app.requestSingleInstanceLock();

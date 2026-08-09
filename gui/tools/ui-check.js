@@ -341,9 +341,70 @@ async function main() {
 
     // Sauber trennen, bevor der Prozess beendet wird (TEARDOWN).
     await cdp.evaluate(`window.luftspiegel.mirror.stop({ target: '192.168.178.125' })`);
+
+    // -----------------------------------------------------------------
+    // Prüfpunkt 5: der Daemon-State "pin_required" wird als laufende
+    // Kopplung klassifiziert, nicht als "getrennt".
+    //
+    // Das ist genau der Fall, den dieser Test vorher NICHT abdecken
+    // konnte: der fake-daemon lieferte deutsche State-Strings ("wartet
+    // auf pin"), der echte Go-Daemon aber "pin_required"
+    // (StatePINRequired, internal/daemon/daemon.go). classifyStatus()
+    // kannte den Wert nicht, er fiel in den Default-Bucket
+    // "disconnected" -> graue Pille und deaktivierter Stop-Button,
+    // während der Nutzer gerade seine PIN eintippt. Der fake-daemon
+    // spricht jetzt dieselben States wie der echte Daemon, damit dieser
+    // Prüfpunkt überhaupt etwas beweist.
+    // -----------------------------------------------------------------
+    log('Prüfe PIN-Zustand (192.168.178.200 verlangt PIN) …');
+    await cdp.evaluate(`window.luftspiegel.mirror.start({ target: '192.168.178.200', port: 7000, pin: '' })`);
+    // Auf mindestens einen Statuspoll warten: erst der treibt
+    // applyConnectionState() -> classifyStatus() mit dem echten State
+    // "pin_required". startMirroring() selbst setzt die Pille bei
+    // needs_pin nur manuell auf "connecting" und kehrt zurück - ein Test,
+    // der direkt danach misst, würde classifyStatus() gar nicht prüfen.
+    await new Promise((r) => setTimeout(r, 2500));
+    const pinResult = await cdp.evaluate(`
+      (() => {
+        const pill = document.getElementById('connPill');
+        return {
+          bucket: pill ? pill.dataset.state : null,
+          label: document.getElementById('connLabel').textContent.trim(),
+          stopDisabled: document.getElementById('btnStop').disabled,
+        };
+      })()
+    `);
+    log('PIN-Zustand Rohdaten:', JSON.stringify(pinResult));
+    try {
+      assert(
+        pinResult.bucket === 'connecting',
+        `PIN-Zustand: Statuspille steht auf "connecting" (war: ${pinResult.bucket}, Label "${pinResult.label}")`
+      );
+      assert(!pinResult.stopDisabled, 'PIN-Zustand: Abbrechen/Stopp bleibt bedienbar');
+    } catch (err) {
+      failures.push(err.message);
+    }
+    await cdp.evaluate(`window.luftspiegel.mirror.stop({})`);
   } finally {
+    // Regulär beenden statt kill(): child.kill() ist unter Windows ein
+    // TerminateProcess und umgeht damit before-quit -> cleanShutdown() ->
+    // stopSidecarClean() -> disconnect/TEARDOWN, also genau den einen
+    // Exit-Pfad, den das Projekt garantieren will - der Test hätte ihn nie
+    // durchlaufen. window.close() ist der realistischste Auslöser: bei
+    // trayIcon=false (Default) führt er über 'window-all-closed' zu
+    // app.quit() und damit durch den echten before-quit-Handler.
+    // Hängt dieser Weg, ist das ein Testfehler und kein Grund, still auf
+    // kill() auszuweichen.
+    if (electron) {
+      const exitedCleanly = await quitElectronCleanly(cdp, electron, 10000);
+      if (!exitedCleanly) {
+        failures.push('Electron hat sich nach window.close() nicht innerhalb von 10s regulär beendet (before-quit/cleanShutdown hängt?)');
+        electron.kill();
+      } else {
+        log('OK: Electron regulär über before-quit/cleanShutdown beendet');
+      }
+    }
     if (cdp) cdp.close();
-    if (electron) electron.kill();
     if (fakeDaemon) fakeDaemon.kill();
     if (userDataDir) {
       // Best effort: Electron braucht nach dem kill() einen Moment, bis es
@@ -370,6 +431,39 @@ async function main() {
 
 function cap(s) {
   return s[0].toUpperCase() + s.slice(1);
+}
+
+/**
+ * Beendet den Electron-Prozess über den regulären Exit-Pfad und wartet auf
+ * seinen Exit. Gibt true zurück, wenn er sich innerhalb von timeoutMs von
+ * selbst beendet hat.
+ *
+ * Der Renderer hat (contextIsolation, ALLOWED_EVENTS) bewusst keine
+ * app.quit()-Brücke - window.close() ist der Weg, den auch ein Nutzer geht,
+ * und läuft bei trayIcon=false über window-all-closed in app.quit().
+ */
+function quitElectronCleanly(cdp, child, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once('exit', () => finish(true));
+    if (cdp) {
+      // Fire-and-forget: die Antwort auf dieses evaluate kommt u.U. nie,
+      // weil der Renderer mitten in der Auswertung verschwindet - auf den
+      // Prozess-Exit warten wir ohnehin separat.
+      try {
+        cdp.evaluate('window.close()').catch(() => {});
+      } catch (err) {
+        /* CDP-Kanal evtl. schon zu - der Timeout greift dann */
+      }
+    }
+  });
 }
 
 main().catch((err) => {
