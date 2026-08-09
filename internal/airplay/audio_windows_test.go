@@ -40,7 +40,7 @@ func TestWindowsAudioSilenceWithoutClient(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ac, err := StartAudioCapture(ctx, false, 17655)
+	ac, err := StartAudioCapture(ctx, false, 17655, 0)
 	if err != nil {
 		t.Fatalf("StartAudioCapture: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestWindowsAudioConnectProducesFrames(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ac, err := StartAudioCapture(ctx, false, 17656)
+	ac, err := StartAudioCapture(ctx, false, 17656, 0)
 	if err != nil {
 		t.Fatalf("StartAudioCapture: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestWindowsAudioReconnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ac, err := StartAudioCapture(ctx, false, 17657)
+	ac, err := StartAudioCapture(ctx, false, 17657, 0)
 	if err != nil {
 		t.Fatalf("StartAudioCapture: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestWindowsAudioBufferBounded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ac, err := StartAudioCapture(ctx, false, 17658)
+	ac, err := StartAudioCapture(ctx, false, 17658, 0)
 	if err != nil {
 		t.Fatalf("StartAudioCapture: %v", err)
 	}
@@ -215,10 +215,213 @@ func TestWindowsAudioBufferBounded(t *testing.T) {
 	src.mu.Lock()
 	bufLen := len(src.buf)
 	src.mu.Unlock()
-	if bufLen > maxBufferedPCM {
-		t.Fatalf("buffered PCM = %d bytes, want <= maxBufferedPCM = %d bytes", bufLen, maxBufferedPCM)
+	// hardCapBytes (not maxBufferedPCM, which no longer exists — see
+	// appendPCM) is the actual configured ceiling now: bufferMs=0 here
+	// resolves to defaultPCMBufferMs, so this is hardCapPct% of that.
+	if bufLen > src.hardCapBytes {
+		t.Fatalf("buffered PCM = %d bytes, want <= hardCapBytes = %d bytes", bufLen, src.hardCapBytes)
 	}
-	t.Logf("after flooding 5x1s of 48kHz PCM with no consumer, buffer settled at %d bytes (cap %d)", bufLen, maxBufferedPCM)
+	t.Logf("after flooding 5x1s of 48kHz PCM with no consumer, buffer settled at %d bytes (hard cap %d)", bufLen, src.hardCapBytes)
+}
+
+// TestWindowsAudioBufferSettlesNearTarget is the core regression test for the
+// bug this file exists to fix: a backlog built up by a burst must ease back
+// down toward the configured target over subsequent appends, not stay parked
+// at hardCapBytes forever. See appendPCM's doc comment for the two-step
+// drain/backstop design this exercises.
+func TestWindowsAudioBufferSettlesNearTarget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// An explicit, readable target rather than the default, so the expected
+	// byte thresholds below are easy to sanity-check by hand.
+	ac, err := StartAudioCapture(ctx, false, 17663, 100)
+	if err != nil {
+		t.Fatalf("StartAudioCapture: %v", err)
+	}
+	defer ac.Stop()
+
+	src := ac.pcmPipe.(*tcpPCMSource)
+
+	// Simulate a startup burst far beyond every threshold: appendPCM's
+	// emergency backstop must clip it straight to hardCapBytes in this one
+	// call (this is also the "drain counts a hard-cap overflow" case that
+	// TestWindowsAudioDrainCounted checks against the stats side).
+	src.appendPCM(make([]byte, src.hardCapBytes*3))
+	src.mu.Lock()
+	afterBurst := len(src.buf)
+	src.mu.Unlock()
+	if afterBurst != src.hardCapBytes {
+		t.Fatalf("buffer after burst = %d bytes, want exactly hardCapBytes = %d", afterBurst, src.hardCapBytes)
+	}
+
+	// Feed small chunks with nothing else draining the buffer (no Read
+	// running concurrently). Each chunk is far smaller than drainStepBytes,
+	// so as long as the level stays above drainThresholdBytes the
+	// incremental drain removes more per append than production adds,
+	// pulling the level down instead of leaving it pinned near the cap.
+	chunk := make([]byte, 200) // 50 stereo frames; well under drainStepBytes
+	var levels []int
+	for i := 0; i < 500; i++ {
+		src.appendPCM(chunk)
+		src.mu.Lock()
+		levels = append(levels, len(src.buf))
+		src.mu.Unlock()
+	}
+
+	final := levels[len(levels)-1]
+	if final >= afterBurst {
+		t.Fatalf("buffer did not shrink from the post-burst level: after burst=%d, after settling=%d", afterBurst, final)
+	}
+	if final > src.drainThresholdBytes {
+		t.Fatalf("buffer settled at %d bytes, want <= drainThresholdBytes=%d (still above the drain trigger)", final, src.drainThresholdBytes)
+	}
+	if final >= src.hardCapBytes {
+		t.Fatalf("buffer settled at %d bytes, still pinned at hardCapBytes=%d — the bug this test guards against", final, src.hardCapBytes)
+	}
+	t.Logf("buffer settled at %d bytes (target=%d threshold=%d hardCap=%d) after %d appends",
+		final, src.targetBytes, src.drainThresholdBytes, src.hardCapBytes, len(levels))
+}
+
+// TestWindowsAudioBufferNoOscillation checks that the settling exercised by
+// TestWindowsAudioBufferSettlesNearTarget is smooth rather than a sawtooth
+// between drainThresholdBytes and hardCapBytes: once the level first reaches
+// drainThresholdBytes or below, it must not later swing back up toward the
+// cap — it should stay within roughly one drain step of the threshold.
+func TestWindowsAudioBufferNoOscillation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ac, err := StartAudioCapture(ctx, false, 17664, 100)
+	if err != nil {
+		t.Fatalf("StartAudioCapture: %v", err)
+	}
+	defer ac.Stop()
+
+	src := ac.pcmPipe.(*tcpPCMSource)
+	src.appendPCM(make([]byte, src.hardCapBytes*3))
+
+	chunk := make([]byte, 200)
+	var levels []int
+	settledAt := -1
+	for i := 0; i < 500; i++ {
+		src.appendPCM(chunk)
+		src.mu.Lock()
+		n := len(src.buf)
+		src.mu.Unlock()
+		levels = append(levels, n)
+		if settledAt < 0 && n <= src.drainThresholdBytes {
+			settledAt = i
+		}
+	}
+	if settledAt < 0 {
+		t.Fatalf("buffer never reached drainThresholdBytes=%d within %d appends", src.drainThresholdBytes, len(levels))
+	}
+
+	// One drain step of margin absorbs the normal threshold-crossing
+	// overshoot (chunk added, then drained back down) that happens on every
+	// cycle near the threshold; anything past that means the level bounced
+	// back up toward hardCapBytes instead of staying settled.
+	margin := src.drainThresholdBytes + drainStepBytes
+	for i := settledAt; i < len(levels); i++ {
+		if levels[i] > margin {
+			t.Fatalf("buffer at append %d = %d bytes, want <= %d (threshold+one drain step) after first settling at append %d — looks like oscillation back toward hardCapBytes=%d",
+				i, levels[i], margin, settledAt, src.hardCapBytes)
+		}
+	}
+	t.Logf("buffer first settled at append %d and stayed within one drain step of drainThresholdBytes=%d for the remaining %d appends",
+		settledAt, src.drainThresholdBytes, len(levels)-settledAt)
+}
+
+// TestWindowsAudioUnderrunCounted verifies RecordAudioUnderrun fires (with a
+// nonzero silence-byte count) when Read has to pad its result because no
+// client is connected — the same condition TestWindowsAudioSilenceWithoutClient
+// exercises, but checked against the stats side this time.
+func TestWindowsAudioUnderrunCounted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ac, err := StartAudioCapture(ctx, false, 17665, 0)
+	if err != nil {
+		t.Fatalf("StartAudioCapture: %v", err)
+	}
+	defer ac.Stop()
+
+	stats := newSessionStats()
+	ac.SetStats(stats)
+
+	pcm := make([]byte, 1408) // one ALAC frame's worth
+	if _, err := ac.pcmPipe.Read(pcm); err != nil {
+		t.Fatalf("Read with no client: %v", err)
+	}
+
+	snap := stats.Snapshot()
+	if snap.AudioUnderruns != 1 {
+		t.Fatalf("AudioUnderruns = %d, want 1", snap.AudioUnderruns)
+	}
+	if snap.AudioSilenceMs <= 0 {
+		t.Fatalf("AudioSilenceMs = %v, want > 0 after a fully-silent read", snap.AudioSilenceMs)
+	}
+	t.Logf("one silent read recorded AudioUnderruns=%d AudioSilenceMs=%.2f", snap.AudioUnderruns, snap.AudioSilenceMs)
+}
+
+// TestWindowsAudioDrainCounted verifies RecordAudioDrain fires when an
+// oversized append triggers the hard-cap backstop — the case
+// appendPCM's doc comment calls out explicitly: a hard-cap overflow must
+// count as drain too, not vanish into a separate/invisible path.
+func TestWindowsAudioDrainCounted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ac, err := StartAudioCapture(ctx, false, 17666, 40) // small, min-clamped target for a small/fast overflow
+	if err != nil {
+		t.Fatalf("StartAudioCapture: %v", err)
+	}
+	defer ac.Stop()
+
+	src := ac.pcmPipe.(*tcpPCMSource)
+	stats := newSessionStats()
+	ac.SetStats(stats)
+
+	src.appendPCM(make([]byte, src.hardCapBytes*2))
+
+	snap := stats.Snapshot()
+	if snap.AudioDrainMs <= 0 {
+		t.Fatalf("AudioDrainMs = %v, want > 0 after an oversized append", snap.AudioDrainMs)
+	}
+
+	src.mu.Lock()
+	bufLen := len(src.buf)
+	src.mu.Unlock()
+	if bufLen != src.hardCapBytes {
+		t.Fatalf("buffer after oversized append = %d bytes, want exactly hardCapBytes = %d", bufLen, src.hardCapBytes)
+	}
+	t.Logf("oversized append recorded AudioDrainMs=%.2f and clipped buffer to hardCapBytes=%d", snap.AudioDrainMs, src.hardCapBytes)
+}
+
+// TestWindowsAudioBufferMsClamping verifies StartAudioCapture's bufferMs
+// clamping: 0 substitutes the default, and out-of-range values clamp to
+// min/max rather than being used verbatim.
+func TestWindowsAudioBufferMsClamping(t *testing.T) {
+	cases := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero selects default", 0, defaultPCMBufferMs},
+		{"below min clamps up", 10, minPCMBufferMs},
+		{"far above max clamps down", 9999, maxPCMBufferMs},
+		{"min passes through", minPCMBufferMs, minPCMBufferMs},
+		{"max passes through", maxPCMBufferMs, maxPCMBufferMs},
+		{"mid-range passes through", 150, 150},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := resolvePCMBufferMs(c.in); got != c.want {
+				t.Errorf("resolvePCMBufferMs(%d) = %d, want %d", c.in, got, c.want)
+			}
+		})
+	}
 }
 
 var _ io.Reader = (*tcpPCMSource)(nil)

@@ -132,6 +132,29 @@ type MirrorSession struct {
 	// Audio
 	audioStream *AudioStream
 	noAudio     bool
+
+	// stats is nil in tests that build a MirrorSession literal directly; every
+	// SessionStats method tolerates a nil receiver so recording sites need no
+	// guard of their own.
+	stats *SessionStats
+}
+
+// Stats returns a consistent snapshot of this session's connection-quality
+// metrics, or the zero value if the session predates statistics collection.
+func (s *MirrorSession) Stats() StatsSnapshot {
+	if s == nil {
+		return StatsSnapshot{}
+	}
+	return s.stats.Snapshot()
+}
+
+// StatsCollector exposes the session's recorder so the capture layer can
+// annotate it with encoder parameters it alone knows.
+func (s *MirrorSession) StatsCollector() *SessionStats {
+	if s == nil {
+		return nil
+	}
+	return s.stats
 }
 
 func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
@@ -361,6 +384,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	audioDataPort := 0
 	audioControlPort := 0
 	var receiverEventPort int
+	var receiverRenderLatencyMs int // arrivalToRenderLatencyMs from the audio stream SETUP response, if any
 	audioControlLPort := audioCtrlConn.LocalAddr().(*net.UDPAddr).Port
 	audioLatencySamples := samplesFor44k1(sessionLatency)
 	skipRecord := false
@@ -535,6 +559,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 					// This is the receiver's platform/I/O delay, not the RTP
 					// playout lead negotiated in latencyMax and TimeAnnounce.
 					dbg("[SETUP] receiver arrival-to-render latency: %dms", latency)
+					receiverRenderLatencyMs = latency
 				}
 				dbg("[SETUP] audio stream: dataPort=%d controlPort=%d", audioDataPort, audioControlPort)
 			}
@@ -668,6 +693,13 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		timingConn:     timingConn,
 		timestampBias:  sessionLatency,
 		mediaClock:     clock,
+		stats:          newSessionStats(),
+	}
+	// Encoder/rate-control names are known to the capture layer, not here; the
+	// caller fills them in via Stats().SetVideoParams once capture is up.
+	session.stats.SetTargetLatency(sessionLatency)
+	if receiverRenderLatencyMs > 0 {
+		session.stats.RecordReceiverRenderLatency(time.Duration(receiverRenderLatencyMs) * time.Millisecond)
 	}
 
 	// Presentation (display) size advertised in the codec header. Genuine senders
@@ -819,9 +851,21 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 
 	var latestSPS, latestPPS []byte // raw NAL data WITHOUT start code
 	var vclBuf []byte               // AVCC-formatted data accumulating for current access unit
-	var pendingKeyframe bool        // true if vclBuf contains IDR slice(s)
-	var codecSent bool              // true if codec frame sent for current keyframe
-	var streamPrimed bool           // true after first SPS/PPS+IDR has been sent
+	// auArrivalAt is when the first bytes of the access unit currently being
+	// assembled arrived from the capture, i.e. when ffmpeg handed them over —
+	// deliberately NOT when the first slice reached vclBuf.
+	//
+	// The delay this metric exists to expose is the parser holding a finished
+	// access unit back until the *next* one starts arriving. That wait happens
+	// before the slice ever reaches vclBuf, so stamping at vclBuf would put the
+	// wait outside the measured interval and report ~0ms both with and without
+	// the idle flush — making the fix look like it did nothing. Measuring from
+	// arrival puts the hold inside the interval on both code paths, so the two
+	// are comparable.
+	var auArrivalAt time.Time
+	var pendingKeyframe bool // true if vclBuf contains IDR slice(s)
+	var codecSent bool       // true if codec frame sent for current keyframe
+	var streamPrimed bool    // true after first SPS/PPS+IDR has been sent
 	var frameCount int
 	var lastProgressLog time.Time
 	var nalLog strings.Builder
@@ -840,6 +884,7 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			if !pendingKeyframe || latestSPS == nil || latestPPS == nil {
 				vclBuf = vclBuf[:0]
 				nalLog.Reset()
+				auArrivalAt = time.Time{}
 				return nil
 			}
 		}
@@ -897,9 +942,15 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		if err := s.sendFrame(frameData, pendingKeyframe, packetTimestamp, packetTimeline); err != nil {
 			return fmt.Errorf("send %s: %w", keyframeStr, err)
 		}
+		var auHold time.Duration
+		if !auArrivalAt.IsZero() {
+			auHold = time.Since(auArrivalAt)
+		}
+		s.stats.RecordFrame(len(frameData), keyframeStr == "IDR", auHold)
 		vclBuf = vclBuf[:0]
 		pendingKeyframe = false
 		codecSent = false
+		auArrivalAt = time.Time{}
 		frameCount++
 		if time.Since(lastProgressLog) >= 5*time.Second {
 			dbg("[STREAM] video progress: sent frame %d (%s, %d bytes)", frameCount, keyframeStr, len(frameData))
@@ -908,96 +959,185 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		return nil
 	}
 
+	// handleNAL applies one delimited NAL to the current access unit. Shared by
+	// the normal read path and the idle-flush path so both take exactly the
+	// same flush decisions.
+	handleNAL := func(nal []byte) error {
+		nt := nalType(nal)
+		raw := stripStartCode(nal)
+
+		// Log first 20 AU sequences in detail
+		if frameCount < 20 {
+			fmt.Fprintf(&nalLog, "NAL type=%d len=%d ", nt, len(raw))
+			if len(raw) > 0 {
+				fmt.Fprintf(&nalLog, "hdr=%02x", raw[0])
+			}
+			nalLog.WriteByte('|')
+		}
+
+		switch nt {
+		case 9: // AUD — access unit delimiter, flush previous frame
+			if err := flushVCL(); err != nil {
+				return err
+			}
+		case 7: // SPS — flush before keyframe
+			if err := flushVCL(); err != nil {
+				return err
+			}
+			latestSPS = raw
+		case 8: // PPS
+			latestPPS = raw
+		case 6: // SEI — skip, don't include in VCL data
+		case 5: // IDR VCL slice — accumulate (may be multi-slice)
+			// If IDR appears while non-IDR data is buffered, close previous AU first.
+			if len(vclBuf) > 0 && !pendingKeyframe {
+				if err := flushVCL(); err != nil {
+					return err
+				}
+			}
+			// New AU (first slice) within an IDR sequence → flush previous IDR AU.
+			if len(vclBuf) > 0 && pendingKeyframe && isFirstSlice(raw) {
+				if err := flushVCL(); err != nil {
+					return err
+				}
+			}
+			pendingKeyframe = true
+			vclBuf = append(vclBuf, avccWrap(raw)...)
+		case 1, 2, 3, 4: // non-IDR VCL slice — accumulate
+			// Flush when transitioning from keyframe AU to non-IDR AU.
+			if len(vclBuf) > 0 && pendingKeyframe {
+				if err := flushVCL(); err != nil {
+					return err
+				}
+			}
+			// New AU (first slice) — flush the previous P-frame.
+			// Without this, consecutive P-frames accumulate if AUDs
+			// are absent (some encoders/h264parse versions).
+			if len(vclBuf) > 0 && !pendingKeyframe && isFirstSlice(raw) {
+				if err := flushVCL(); err != nil {
+					return err
+				}
+			}
+			vclBuf = append(vclBuf, avccWrap(raw)...)
+		default:
+			if frameCount < 20 {
+				dbg("[STREAM] ignoring NAL type=%d len=%d", nt, len(raw))
+			}
+		}
+		return nil
+	}
+
+	// Reads run in their own goroutine so the main loop can act on an idle
+	// input instead of being parked in a blocking Read. Two buffers alternate:
+	// the reader can be at most one Read ahead of the main loop (the channel is
+	// unbuffered, so it cannot start a third read before the main loop has
+	// taken the first), and parser.Push copies immediately, so the buffer the
+	// main loop is working on is never the one being filled.
+	type readResult struct {
+		buf []byte
+		err error
+	}
+	readCh := make(chan readResult)
+	readerStop := make(chan struct{})
+	// Closing readerStop releases a reader blocked on the channel send. A
+	// reader blocked inside capture.Read instead exits when the capture is
+	// closed, which session teardown always does — the daemon closes the
+	// broadcast sink on disconnect, and the direct path closes the ffmpeg pipe.
+	defer close(readerStop)
+
+	// readerExited is closed when the reader goroutine returns. Only used by
+	// tests, which need to prove the goroutine is actually gone rather than
+	// infer it from a process-wide goroutine count that neighbouring tests
+	// also move.
+	readerExited := make(chan struct{})
+	if streamReaderExited != nil {
+		streamReaderExited(readerExited)
+	}
+
+	go func() {
+		defer close(readerExited)
+		buffers := [2][]byte{buf, make([]byte, len(buf))}
+		which := 0
+		for {
+			n, err := capture.Read(buffers[which])
+			select {
+			case readCh <- readResult{buf: buffers[which][:n], err: err}:
+			case <-readerStop:
+				return
+			}
+			if err != nil {
+				return
+			}
+			which ^= 1
+		}
+	}()
+
+	// idleTicks counts consecutive ticks with no data. Two are required before
+	// releasing a held-back NAL; see h264Parser.FlushTail for why one is not
+	// enough.
+	idleTicker := time.NewTicker(idleFlushInterval)
+	defer idleTicker.Stop()
+	idleTicks := 0
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-		}
 
-		n, err := capture.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				// Flush any remaining VCL data
-				if flushErr := flushVCL(); flushErr != nil {
-					return flushErr
-				}
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				return fmt.Errorf("capture process exited unexpectedly (EOF)")
+		case <-idleTicker.C:
+			if idleTicks++; idleTicks < 2 {
+				continue
 			}
-			return fmt.Errorf("read capture: %w", err)
-		}
-		if n == 0 {
-			continue
-		}
-		if frameCount == 0 {
-			dbg("[CAPTURE] read %d bytes start=% x", n, buf[:min(n, 16)])
-		}
-
-		nals := parser.Push(buf[:n])
-		for _, nal := range nals {
-			nt := nalType(nal)
-			raw := stripStartCode(nal)
-
-			// Log first 20 AU sequences in detail
-			if frameCount < 20 {
-				fmt.Fprintf(&nalLog, "NAL type=%d len=%d ", nt, len(raw))
-				if len(raw) > 0 {
-					fmt.Fprintf(&nalLog, "hdr=%02x", raw[0])
-				}
-				nalLog.WriteByte('|')
+			nal := parser.FlushTail()
+			if nal == nil {
+				continue
+			}
+			if err := handleNAL(nal); err != nil {
+				return err
+			}
+			// The tail was the last NAL of its access unit, so nothing further
+			// is coming to trigger the usual next-AU flush.
+			if err := flushVCL(); err != nil {
+				return err
 			}
 
-			switch nt {
-			case 9: // AUD — access unit delimiter, flush previous frame
-				if err := flushVCL(); err != nil {
-					return err
+		case res := <-readCh:
+			if len(res.buf) > 0 {
+				idleTicks = 0
+				// First data since the last send starts the clock for the next
+				// access unit. Kept here rather than at the vclBuf append so
+				// the parser's hold-back is inside the measured interval — see
+				// auArrivalAt's declaration.
+				if auArrivalAt.IsZero() {
+					auArrivalAt = time.Now()
 				}
-			case 7: // SPS — flush before keyframe
-				if err := flushVCL(); err != nil {
-					return err
+				if frameCount == 0 {
+					dbg("[CAPTURE] read %d bytes start=% x", len(res.buf), res.buf[:min(len(res.buf), 16)])
 				}
-				latestSPS = raw
-			case 8: // PPS
-				latestPPS = raw
-			case 6: // SEI — skip, don't include in VCL data
-			case 5: // IDR VCL slice — accumulate (may be multi-slice)
-				// If IDR appears while non-IDR data is buffered, close previous AU first.
-				if len(vclBuf) > 0 && !pendingKeyframe {
-					if err := flushVCL(); err != nil {
+				for _, nal := range parser.Push(res.buf) {
+					if err := handleNAL(nal); err != nil {
 						return err
 					}
 				}
-				// New AU (first slice) within an IDR sequence → flush previous IDR AU.
-				if len(vclBuf) > 0 && pendingKeyframe && isFirstSlice(raw) {
-					if err := flushVCL(); err != nil {
-						return err
+			}
+			if res.err != nil {
+				if res.err == io.EOF {
+					// Release whatever the parser was still holding before
+					// reporting the end of the stream.
+					if nal := parser.FlushTailFinal(); nal != nil {
+						if err := handleNAL(nal); err != nil {
+							return err
+						}
 					}
-				}
-				pendingKeyframe = true
-				vclBuf = append(vclBuf, avccWrap(raw)...)
-			case 1, 2, 3, 4: // non-IDR VCL slice — accumulate
-				// Flush when transitioning from keyframe AU to non-IDR AU.
-				if len(vclBuf) > 0 && pendingKeyframe {
-					if err := flushVCL(); err != nil {
-						return err
+					if flushErr := flushVCL(); flushErr != nil {
+						return flushErr
 					}
-				}
-				// New AU (first slice) — flush the previous P-frame.
-				// Without this, consecutive P-frames accumulate if AUDs
-				// are absent (some encoders/h264parse versions).
-				if len(vclBuf) > 0 && !pendingKeyframe && isFirstSlice(raw) {
-					if err := flushVCL(); err != nil {
-						return err
+					if ctx.Err() != nil {
+						return ctx.Err()
 					}
+					return fmt.Errorf("capture process exited unexpectedly (EOF)")
 				}
-				vclBuf = append(vclBuf, avccWrap(raw)...)
-			default:
-				if frameCount < 20 {
-					dbg("[STREAM] ignoring NAL type=%d len=%d", nt, len(raw))
-				}
+				return fmt.Errorf("read capture: %w", res.err)
 			}
 		}
 	}
@@ -1010,22 +1150,104 @@ func min(a, b int) int {
 	return b
 }
 
+// idleFlushInterval is how often StreamFrames checks an otherwise idle capture
+// input for a held-back NAL. Two consecutive quiet ticks are required before
+// anything is released (see h264Parser.FlushTail), so the effective added
+// delay is one to two intervals.
+//
+// 4ms is chosen to sit well above the gap between the pipe writes that make up
+// a single access unit — releasing mid-access-unit would truncate a NAL — while
+// staying far below the 33ms frame interval at 30fps that the whole mechanism
+// exists to avoid waiting for.
+const idleFlushInterval = 4 * time.Millisecond
+
+// streamReaderExited is a test hook: when set, StreamFrames hands it a channel
+// that closes once the capture reader goroutine has returned. Nil in
+// production. Exists because teardown correctness — no reader left holding the
+// capture — is the property this project can least afford to get wrong, and
+// asserting it via runtime.NumGoroutine() is too loose to be a real check.
+var streamReaderExited func(<-chan struct{})
+
 // h264Parser incrementally extracts NAL units from either Annex-B or length-prefixed AVC streams.
 type h264Parser struct {
 	buf []byte
+
+	// idleLen is the buffer length observed at the previous idle check, or -1
+	// if data has arrived since. See FlushTail.
+	idleLen int
 }
 
 func newH264Parser() *h264Parser {
-	return &h264Parser{buf: make([]byte, 0, 512*1024)}
+	return &h264Parser{buf: make([]byte, 0, 512*1024), idleLen: -1}
 }
 
 func (p *h264Parser) Push(data []byte) [][]byte {
 	p.buf = append(p.buf, data...)
+	// Any new byte invalidates the "buffer has stopped growing" evidence
+	// FlushTail relies on.
+	p.idleLen = -1
 
 	if hasStartCode(p.buf) {
 		return p.pushAnnexB()
 	}
 	return p.pushAVCC()
+}
+
+// FlushTail releases the trailing Annex-B NAL that pushAnnexB deliberately
+// holds back.
+//
+// pushAnnexB can only delimit a NAL once it has seen the *next* start code, so
+// the last NAL of every access unit sits in the buffer until the following
+// frame begins to arrive — a full frame interval (~33ms at 30fps) of latency
+// that is pure waiting, not work. FlushTail lets an idle input break that tie.
+//
+// The danger is releasing a NAL that is merely incomplete rather than final:
+// a truncated NAL is not detectably bad, it decodes into garbage on the
+// receiver. So the tail is released only once the buffer has been observed at
+// the same length on two consecutive idle checks with no Push in between. A
+// buffer that has stopped growing cannot be a write still in progress; a
+// partially delivered NAL will always have grown by the next check. Combined
+// with ffmpeg's -flush_packets (which makes each pipe write one whole access
+// unit), that reduces the hold to roughly two idle intervals.
+//
+// Returns nil when there is nothing safe to release yet. Only ever fires for
+// Annex-B: the length-prefixed AVCC path already knows exactly where each NAL
+// ends and never holds one back.
+func (p *h264Parser) FlushTail() []byte {
+	return p.flushTail(true)
+}
+
+// FlushTailFinal releases the trailing NAL without waiting for the stability
+// evidence FlushTail requires. Only valid at end of stream, where no further
+// bytes can arrive by definition, so a short tail is genuinely the whole NAL
+// rather than a write in progress.
+func (p *h264Parser) FlushTailFinal() []byte {
+	return p.flushTail(false)
+}
+
+func (p *h264Parser) flushTail(requireStable bool) []byte {
+	if len(p.buf) == 0 {
+		p.idleLen = -1
+		return nil
+	}
+	// The remainder must be exactly one NAL: a start code at offset 0 and no
+	// further start code after it. Anything else is either AVCC data or a
+	// resynchronising buffer, neither of which is ours to release.
+	if findStartCode(p.buf, 0) != 0 || findStartCode(p.buf, 3) >= 0 {
+		p.idleLen = -1
+		return nil
+	}
+	if requireStable && p.idleLen != len(p.buf) {
+		// First quiet observation at this length — record it and wait for a
+		// second one to confirm the writer really has stopped.
+		p.idleLen = len(p.buf)
+		return nil
+	}
+
+	nal := append([]byte(nil), p.buf...)
+	p.buf = p.buf[:0]
+	p.idleLen = -1
+	return nal
 }
 
 func (p *h264Parser) pushAnnexB() [][]byte {
@@ -1459,10 +1681,14 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimesta
 	bufs := net.Buffers{header[:], framePayload}
 	s.dataMu.Lock()
 	s.dataConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	writeStart := time.Now()
 	_, err := bufs.WriteTo(s.dataConn)
+	writeDuration := time.Since(writeStart)
 	s.dataMu.Unlock()
 	if err != nil {
 		dbg("[SEND] write error on frame seq=%d: %v", s.frameSeq, err)
+	} else {
+		s.stats.RecordSocketWrite(writeDuration)
 	}
 	return err
 }
@@ -1568,6 +1794,29 @@ func (s *MirrorSession) dataHeartbeatLoop(ctx context.Context) {
 	}
 }
 
+// recordFeedbackRTT reports the /feedback round trip to the session stats,
+// subtracting the receiver's self-reported processing time when present so
+// the metric approximates network RTT instead of including receiver-side
+// work. This is measurement only: it does not change mediaClock.reanchor,
+// which by design still treats the receiver's timestamp as delay-free (see
+// the anchorLocal = receivedAt comment on mediaClock.reanchor above) — the
+// systematic offset that introduces is left uncorrected, only observed here.
+func (s *MirrorSession) recordFeedbackRTT(sentAt, receivedAt time.Time, headers map[string]string) {
+	rtt := receivedAt.Sub(sentAt)
+	if raw, ok := headers["x-apple-processingtime"]; ok {
+		// Guard against a garbage header value overflowing the duration
+		// multiplication, mirroring the bound receiverClockTimestamp applies
+		// to the same header family above.
+		maxMillis := uint64(math.MaxInt64 / int64(time.Millisecond))
+		if processingMillis, err := strconv.ParseUint(raw, 10, 64); err == nil && processingMillis <= maxMillis {
+			if adjusted := rtt - time.Duration(processingMillis)*time.Millisecond; adjusted > 0 {
+				rtt = adjusted
+			}
+		}
+	}
+	s.stats.RecordRTT(rtt)
+}
+
 // feedbackLoop sends periodic POST /feedback requests like AirMyPC (every 2s).
 // Sends an immediate first feedback to prevent UxPlay's 3-second timeout from
 // killing the connection before the first ticker fires.
@@ -1576,6 +1825,7 @@ func (s *MirrorSession) feedbackLoop(ctx context.Context) {
 	// captured frame for several seconds, but the receiver's feedback timeout is
 	// already running by then.
 	sendFeedback := func() {
+		requestSentAt := time.Now()
 		body, headers, err := s.client.rtspRequest("POST", "/feedback", "", nil, nil)
 		receivedAt := time.Now()
 		if err != nil {
@@ -1587,6 +1837,7 @@ func (s *MirrorSession) feedbackLoop(ctx context.Context) {
 				dbg("[PTP] feedback clock update ignored: %v", err)
 			}
 		}
+		s.recordFeedbackRTT(requestSentAt, receivedAt, headers)
 		if len(body) == 0 {
 			return
 		}

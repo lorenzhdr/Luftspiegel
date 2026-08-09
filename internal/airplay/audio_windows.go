@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,20 +30,74 @@ const (
 	pcmBytesPerFrame  = 4 // stereo, S16LE: 2 channels * 2 bytes
 	pcmOutBytesPerSec = pcmOutputRate * pcmBytesPerFrame
 
-	// maxBufferedPCM bounds the resampled-PCM ring buffer to ~300ms. Anything
-	// beyond this is dropped (oldest first) as it arrives, so a source that
-	// produces faster than ReadFrame consumes cannot make audio drift further
-	// and further behind video; see tcpPCMSource.appendPCM.
-	maxBufferedPCM = pcmOutBytesPerSec * 300 / 1000
+	// defaultPCMBufferMs is the backlog target when the caller does not
+	// specify one.
+	defaultPCMBufferMs = 120
+	// minPCMBufferMs / maxPCMBufferMs bound the configurable target. Below the
+	// minimum an ordinary scheduling hiccup on the sender turns into audible
+	// dropouts, because an underrun is padded with silence and never reported
+	// as an error.
+	minPCMBufferMs = 40
+	maxPCMBufferMs = 500
+
+	// drainThresholdPct is how far above the configured target (as a percent
+	// of it) the buffer must climb before appendPCM's incremental drain does
+	// anything. 150% gives ordinary jitter — a slightly late TCP read, a
+	// scheduler hiccup on either end of the connection — enough headroom to
+	// resolve on its own through normal consumption, so draining stays the
+	// exception rather than a constant tug-of-war against a source that is
+	// merely a bit bursty.
+	drainThresholdPct = 150
+	// hardCapPct is the emergency backstop, kept from the original
+	// drop-oldest implementation: a single append that jumps the buffer past
+	// this (e.g. one oversized TCP read delivered after a stall) is clipped
+	// straight down in that same call instead of waiting for the
+	// incremental drain — bounded to drainStepBytes per call — to catch up
+	// over however many further appends that would take. Set above
+	// drainThresholdPct with real headroom so it only fires for a genuine
+	// burst; the incremental drain already handles the steady-state
+	// overshoot this bug was actually about.
+	hardCapPct = 200
+
+	// alacFrameBytes is one ALAC frame's worth of PCM at the output rate —
+	// 352 samples * pcmBytesPerFrame — used to size the drain increment in
+	// units that line up with what ReadFrame consumes per call.
+	alacFrameBytes = 352 * pcmBytesPerFrame
+	// drainStepFrames/drainStepBytes bound how much a single incremental
+	// drain step removes. The bug this file fixes was dropping the entire
+	// overshoot (historically up to 300ms, i.e. ~180ms of audio) in one
+	// shot, which is an audible click; 1-2 ALAC frames (~8-16ms) is short
+	// enough to be inaudible, so a sustained overshoot eases back toward the
+	// target over many appends/reads instead of cutting once.
+	drainStepFrames = 2
+	drainStepBytes  = drainStepFrames * alacFrameBytes
 
 	// readWaitTimeout bounds how long tcpPCMSource.Read will wait for a full
 	// frame's worth of real PCM before padding the shortfall with silence and
 	// returning anyway. It is set just above one ALAC frame's duration at
 	// 44.1kHz (352/44100 ≈ 8ms) so a healthy stream is never held up waiting,
 	// while a missing/lagging client still gets a bounded, non-blocking read.
-	readWaitTimeout = 12 * time.Millisecond
+	readWaitTimeout  = 12 * time.Millisecond
 	readPollInterval = 1 * time.Millisecond
 )
+
+// resolvePCMBufferMs clamps a caller-requested PCM backlog target to
+// [minPCMBufferMs, maxPCMBufferMs], substituting defaultPCMBufferMs when the
+// caller expressed no preference (0). Broken out as a plain function, rather
+// than inlined into StartAudioCapture, so the clamping rules are unit
+// testable without spinning up a listener.
+func resolvePCMBufferMs(ms int) int {
+	switch {
+	case ms == 0:
+		return defaultPCMBufferMs
+	case ms < minPCMBufferMs:
+		return minPCMBufferMs
+	case ms > maxPCMBufferMs:
+		return maxPCMBufferMs
+	default:
+		return ms
+	}
+}
 
 // StartAudioCapture starts the Windows audio source: either a synthetic sine
 // test tone (testTone=true, used by -test / daemon TestMode, no network
@@ -64,7 +119,11 @@ const (
 // client stalls, ReadFrame (via tcpPCMSource.Read) returns silence within
 // readWaitTimeout instead of blocking or erroring. See tcpPCMSource for the
 // buffering/backpressure and reconnect handling.
-func StartAudioCapture(ctx context.Context, testTone bool, tcpPort int) (*AudioCapture, error) {
+// bufferMs bounds the PCM backlog held for the receiver; 0 selects
+// defaultPCMBufferMs. It is the dominant contributor to audio latency, so it
+// is configurable rather than fixed — see tcpPCMSource for the drain policy
+// that keeps the steady state near the target instead of parked at the cap.
+func StartAudioCapture(ctx context.Context, testTone bool, tcpPort, bufferMs int) (*AudioCapture, error) {
 	captureCtx, cancel := context.WithCancel(ctx)
 
 	ac := &AudioCapture{
@@ -93,7 +152,10 @@ func StartAudioCapture(ctx context.Context, testTone bool, tcpPort int) (*AudioC
 	}
 	dbg("[AUDIO] waiting for PCM audio source to connect on %s (s16le %dHz stereo)", addr, pcmInputRate)
 
-	src := newTCPPCMSource(listener)
+	bufferMs = resolvePCMBufferMs(bufferMs)
+	src := newTCPPCMSource(listener, bufferMs)
+	dbg("[AUDIO] PCM backlog target: %dms (drain above %dms, hard cap %dms)",
+		bufferMs, bufferMs*drainThresholdPct/100, bufferMs*hardCapPct/100)
 	go src.acceptLoop(captureCtx)
 	go func() {
 		<-captureCtx.Done()
@@ -114,10 +176,12 @@ func StartAudioCapture(ctx context.Context, testTone bool, tcpPort int) (*AudioC
 //     arrived (no client connected yet, client disconnected, or client
 //     momentarily behind). It never returns an error except after Close.
 //  2. Bound latency/drift: incoming PCM (after resampling to pcmOutputRate)
-//     is kept in a byte queue capped at maxBufferedPCM; once full, the
-//     oldest bytes are dropped as new data arrives. This is the Windows
-//     equivalent of the Linux backend's one-shot AudioCapture.DrainStale —
-//     see the note on DrainStale below for why it becomes a no-op here.
+//     is kept in a byte queue steered toward a configurable targetBytes by
+//     appendPCM's incremental drain, with hardCapBytes as a hard emergency
+//     ceiling (oldest bytes dropped) for a single burst the incremental
+//     drain cannot absorb in one call. This is the Windows equivalent of the
+//     Linux backend's one-shot AudioCapture.DrainStale — see the note on
+//     DrainStale below for why it becomes a no-op here.
 //  3. Reconnect: exactly one connection is treated as "current" at a time.
 //     A newly accepted connection replaces the previous one — the previous
 //     is closed and its read loop exits. This favors the common real-world
@@ -131,18 +195,54 @@ type tcpPCMSource struct {
 	mu  sync.Mutex
 	buf []byte // resampled pcmOutputRate S16LE PCM, oldest-first
 
+	// targetBytes/drainThresholdBytes/hardCapBytes are derived once (in
+	// newTCPPCMSource) from the caller's bufferMs and never change, so they
+	// need no synchronization of their own — only s.buf, guarded by mu, is
+	// mutated at runtime.
+	targetBytes         int
+	drainThresholdBytes int
+	hardCapBytes        int
+
 	connMu sync.Mutex
 	conn   net.Conn
 
 	closeOnce sync.Once
 	doneCh    chan struct{}
+
+	// stats is set after StartAudioCapture returns, once the caller has a
+	// SessionStats to hand over (see AudioCapture.SetStats in audio.go) —
+	// i.e. concurrently with acceptLoop/readLoop/Read already running.
+	// atomic.Pointer gives a lock-free Store/Load pair for that handoff
+	// without adding a mutex to the append/read hot path, which already
+	// takes mu on every call; a *SessionStats swap doesn't need mu's
+	// exclusion, just word-atomicity. A nil pointer (before SetStats is
+	// called) is a valid, safe value: every SessionStats method tolerates a
+	// nil receiver (see stats.go), so call sites here never need to check.
+	stats atomic.Pointer[SessionStats]
 }
 
-func newTCPPCMSource(listener net.Listener) *tcpPCMSource {
+func newTCPPCMSource(listener net.Listener, bufferMs int) *tcpPCMSource {
+	target := bufferMs * pcmOutBytesPerSec / 1000
+	target -= target % pcmBytesPerFrame
+	threshold := target * drainThresholdPct / 100
+	threshold -= threshold % pcmBytesPerFrame
+	hardCap := target * hardCapPct / 100
+	hardCap -= hardCap % pcmBytesPerFrame
+
 	return &tcpPCMSource{
-		listener: listener,
-		doneCh:   make(chan struct{}),
+		listener:            listener,
+		doneCh:              make(chan struct{}),
+		targetBytes:         target,
+		drainThresholdBytes: threshold,
+		hardCapBytes:        hardCap,
 	}
+}
+
+// SetStats attaches the session's statistics collector. See the stats field
+// doc above for why this is safe to call while acceptLoop/readLoop/Read are
+// already running.
+func (s *tcpPCMSource) SetStats(stats *SessionStats) {
+	s.stats.Store(stats)
 }
 
 // acceptLoop accepts connections until ctx is done or the listener is
@@ -217,21 +317,63 @@ func (s *tcpPCMSource) readLoop(conn net.Conn) {
 	}
 }
 
-// appendPCM adds resampled PCM to the buffer, dropping the oldest bytes
-// beyond maxBufferedPCM (aligned to whole stereo frames) so the buffer never
-// grows without bound and audio latency stays capped.
+// appendPCM adds resampled PCM to the buffer and then, in up to two steps,
+// keeps the backlog near targetBytes instead of parked at hardCapBytes:
+//
+//  1. Incremental drain: if the buffer is above drainThresholdBytes, drop at
+//     most drainStepBytes (~1-2 ALAC frames) from the front. One call only
+//     ever removes one step, so a sustained overshoot eases back down over
+//     many appends/reads rather than being corrected in one audible cut.
+//  2. Emergency backstop: if the buffer is still above hardCapBytes after
+//     step 1 — meaning this single append was too large for one drain step
+//     to absorb (e.g. one oversized TCP read after a stall) — drop straight
+//     down to hardCapBytes. This is the original drop-oldest behavior,
+//     preserved as a rare fallback rather than the everyday mechanism it
+//     used to be (see the maxBufferedPCM removal in the fix this is part
+//     of).
+//
+// Both steps report their drop through RecordAudioDrain: the hard-cap
+// overflow counts as a drain too, deliberately, since a target that is
+// undersized for the incoming stream should show up as sustained drain
+// activity in the stats, not disappear into a separate, harder-to-notice
+// counter. See RecordAudioDrain's doc for how that reads against
+// RecordAudioUnderrun in the GUI.
 func (s *tcpPCMSource) appendPCM(data []byte) {
 	if len(data) == 0 {
 		return
 	}
 	s.mu.Lock()
 	s.buf = append(s.buf, data...)
-	if len(s.buf) > maxBufferedPCM {
-		excess := len(s.buf) - maxBufferedPCM
-		excess -= excess % pcmBytesPerFrame
-		s.buf = s.buf[excess:]
+	drained := 0
+
+	if len(s.buf) > s.drainThresholdBytes {
+		step := drainStepBytes
+		if avail := len(s.buf) - s.targetBytes; step > avail {
+			step = avail
+		}
+		step -= step % pcmBytesPerFrame
+		if step > 0 {
+			s.buf = s.buf[step:]
+			drained += step
+		}
 	}
+
+	if excess := len(s.buf) - s.hardCapBytes; excess > 0 {
+		excess -= excess % pcmBytesPerFrame
+		if excess > 0 {
+			s.buf = s.buf[excess:]
+			drained += excess
+		}
+	}
+
+	bufLen := len(s.buf)
 	s.mu.Unlock()
+
+	stats := s.stats.Load()
+	stats.RecordAudioBuffered(bufLen)
+	if drained > 0 {
+		stats.RecordAudioDrain(drained)
+	}
 }
 
 // Read implements io.Reader for AudioCapture.ReadFrame. It always fills p
@@ -250,7 +392,9 @@ func (s *tcpPCMSource) Read(p []byte) (int, error) {
 		if len(s.buf) >= need {
 			n := copy(p, s.buf)
 			s.buf = s.buf[n:]
+			bufLen := len(s.buf)
 			s.mu.Unlock()
+			s.stats.Load().RecordAudioBuffered(bufLen)
 			return n, nil
 		}
 		s.mu.Unlock()
@@ -269,9 +413,16 @@ func (s *tcpPCMSource) Read(p []byte) (int, error) {
 	s.mu.Lock()
 	n := copy(p, s.buf)
 	s.buf = s.buf[n:]
+	bufLen := len(s.buf)
 	s.mu.Unlock()
 	for i := n; i < need; i++ {
 		p[i] = 0
+	}
+
+	stats := s.stats.Load()
+	stats.RecordAudioBuffered(bufLen)
+	if silence := need - n; silence > 0 {
+		stats.RecordAudioUnderrun(silence)
 	}
 	return need, nil
 }
@@ -299,10 +450,10 @@ func (s *tcpPCMSource) Close() error {
 // on Windows — intentionally, not by omission. The Linux backend needs a
 // one-shot drain because its OS pipe is an unbounded FIFO that keeps
 // whatever backlog accumulated while audio waited for the first video frame.
-// tcpPCMSource's buffer is continuously bounded to maxBufferedPCM
-// (appendPCM, above) as data arrives, so by the time streaming begins,
-// whatever is buffered is already within that same freshness bound; there is
-// no unbounded startup backlog left to remove.
+// tcpPCMSource's buffer is continuously bounded (appendPCM, above) as data
+// arrives, so by the time streaming begins, whatever is buffered is already
+// within that same freshness bound; there is no unbounded startup backlog
+// left to remove.
 
 // sineWaveSource generates a continuous 44.1kHz stereo S16LE sine tone,
 // standing in for the Linux backend's "audiotestsrc wave=sine" test source

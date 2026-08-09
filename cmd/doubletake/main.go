@@ -73,6 +73,7 @@ func main() {
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
 	audioTCPPort := flag.Int("audio-tcp", airplay.DefaultAudioTCPPort, "Windows only: local TCP port (127.0.0.1) that the audio-source GUI connects to, pushing raw PCM (s16le, 44100 Hz, stereo, no header); ignored on Linux. Ignored entirely if -no-audio is set.")
+	audioBufferMs := flag.Int("audio-buffer-ms", 0, "Windows only: target PCM backlog in milliseconds (40-500, 0 = default). This is the dominant contributor to audio latency; lower reduces lag but risks dropouts, which show up as the underrun counter in the statistics.")
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with a control interface (Unix socket on Linux/macOS, TCP on Windows)")
@@ -83,9 +84,14 @@ func main() {
 	stubFile := flag.String("stub-file", "", "Replay a pre-recorded Annex-B .h264 file instead of starting a real capture backend (ffmpeg/GStreamer); loops at EOF, paced at ~fps access units/sec. For testing the mirror pipeline.")
 	maxHeight := flag.Int("max-height", 0, "Windows only: downscale ffmpeg capture so the encoded output is at most this many pixels tall (0 = native resolution); ignored on Linux")
 	outputIndex := flag.Int("output-index", 0, "Windows only: ddagrab output/monitor index to capture (0-based); ignored on Linux")
+	gopSeconds := flag.Int("gop-seconds", 0, "Keyframe interval in seconds (1-10, 0 = encoder default)")
+	rateControl := flag.String("rate-control", "", "Video encoder rate-control strategy: display_remoting (default) or cbr_live")
 	flag.Parse()
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
+	}
+	if err := airplay.ValidateRateControl(*rateControl); err != nil {
+		log.Fatalf("invalid -rate-control: %v", err)
 	}
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
@@ -93,7 +99,26 @@ func main() {
 	airplay.DebugMode = *debug
 
 	if *daemonize {
-		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio, *noCursor, *maxHeight, *outputIndex, *audioTCPPort)
+		runDaemon(daemon.Config{
+			SocketPath:    *socketPath,
+			CredFile:      *credFile,
+			CredBackend:   *credBackend,
+			FPS:           *fps,
+			Bitrate:       *bitrate,
+			HWAccel:       *hwaccel,
+			Debug:         *debug,
+			TestMode:      *testMode,
+			NoEncrypt:     *noEncrypt,
+			DirectKey:     *directKey,
+			NoAudio:       *noAudio,
+			ShowCursor:    !*noCursor,
+			MaxHeight:     *maxHeight,
+			OutputIndex:   *outputIndex,
+			AudioTCPPort:  *audioTCPPort,
+			AudioBufferMs: *audioBufferMs,
+			GOPSeconds:    *gopSeconds,
+			RateControl:   *rateControl,
+		})
 		return
 	}
 
@@ -285,11 +310,17 @@ func main() {
 			log.Println("using synthetic video (videotestsrc) and audio test tone for debugging")
 		}
 		var err error
+		// GOP and rate control are passed through here too: -test/-stub-file is
+		// the pipeline that latency A/B measurements run against when no real
+		// display or receiver is involved, so it has to encode with the same
+		// settings as the real capture path.
 		capture, err = airplay.StartTestCapture(ctx, airplay.CaptureConfig{
-			FPS:      *fps,
-			Bitrate:  *bitrate,
-			HWAccel:  *hwaccel,
-			StubFile: *stubFile,
+			FPS:         *fps,
+			Bitrate:     *bitrate,
+			HWAccel:     *hwaccel,
+			StubFile:    *stubFile,
+			GOPSeconds:  *gopSeconds,
+			RateControl: *rateControl,
 		})
 		if err != nil {
 			log.Fatalf("test capture failed: %v", err)
@@ -313,6 +344,8 @@ func main() {
 			OutputIndex: *outputIndex,
 			MaxHeight:   *maxHeight,
 			StubFile:    *stubFile,
+			GOPSeconds:  *gopSeconds,
+			RateControl: *rateControl,
 		}
 		var err error
 		capture, err = airplay.StartCapture(ctx, captureCfg)
@@ -338,7 +371,7 @@ func main() {
 
 	// Start audio capture and streaming unless disabled.
 	if !*noAudio && session.HasAudio() {
-		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, *audioTCPPort)
+		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, *audioTCPPort, *audioBufferMs)
 		if err != nil {
 			log.Printf("warning: audio capture failed: %v (continuing without audio)", err)
 		} else {
@@ -456,25 +489,11 @@ func compareIPs(a, b string) int {
 	return 0
 }
 
-func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio, noCursor bool, maxHeight, outputIndex, audioTCPPort int) {
-	cfg := daemon.Config{
-		SocketPath:   socketPath,
-		CredFile:     credFile,
-		CredBackend:  credBackend,
-		FPS:          fps,
-		Bitrate:      bitrate,
-		HWAccel:      hwaccel,
-		Debug:        debug,
-		TestMode:     testMode,
-		NoEncrypt:    noEncrypt,
-		DirectKey:    directKey,
-		NoAudio:      noAudio,
-		ShowCursor:   !noCursor,
-		MaxHeight:    maxHeight,
-		OutputIndex:  outputIndex,
-		AudioTCPPort: audioTCPPort,
-	}
-
+// runDaemon takes the assembled Config rather than a positional parameter per
+// flag: the list had grown past a dozen same-typed arguments, where adding a
+// setting meant threading it through in exactly the right slot and a
+// transposition would compile cleanly and misbehave at runtime.
+func runDaemon(cfg daemon.Config) {
 	d, err := daemon.New(cfg)
 	if err != nil {
 		log.Fatalf("[daemon] %v", err)

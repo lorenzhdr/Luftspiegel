@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Menu, Tray, nativeImage, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
@@ -20,7 +20,12 @@ const AUDIO_PORT = 7655;
 const AUDIO_RECONNECT_MIN_MS = 500;
 const AUDIO_RECONNECT_MAX_MS = 8000;
 
-const STATUS_POLL_INTERVAL_MS = 2000;
+// status wird schneller gepollt, solange gestreamt wird (Statistik-Tab
+// braucht frischere Werte), sonst reicht der träge 2s-Rhythmus. Der
+// devices-Poll bleibt bewusst unabhängig davon immer bei 2s.
+const STATUS_POLL_INTERVAL_IDLE_MS = 2000;
+const STATUS_POLL_INTERVAL_STREAMING_MS = 1000;
+const DEVICES_POLL_INTERVAL_MS = 2000;
 const SIDECAR_READY_TIMEOUT_MS = 6000;
 const SIDECAR_READY_POLL_MS = 350;
 const CONNECT_TIMEOUT_MS = 15000;
@@ -30,12 +35,41 @@ const DEFAULT_TIMEOUT_MS = 3000;
 
 const SETTINGS_FILE = 'settings.json';
 
+// Die Qualitäts-Presets (welche Werte "Niedrigste Latenz" / "Ausgewogen" /
+// "Beste Qualität" setzen) sind reine UI-Logik und leben daher im Renderer
+// (app.js) - main.js validiert nur die resultierenden Einzelwerte.
+
 const DEFAULT_SETTINGS = {
   fps: 30,
   maxHeight: 1080, // 0 = native
   outputIndex: 0,
   bitrate: 0, // 0 = automatisch
   audioEnabled: false, // Video ist erprobt, Audio ist neu - Default aus
+
+  // Qualitäts-Preset
+  preset: 'balanced',
+  expertMode: false,
+
+  // Latenz & Encoder (nur im Expertenmodus editierbar, sonst vom Preset gesetzt)
+  targetLatencyMs: 100,
+  gopSeconds: 4,
+  rateControl: 'display_remoting',
+  hwaccel: 'auto',
+  audioBufferMs: 120,
+
+  // Video
+  showCursor: true,
+
+  // App-Verhalten (reine UI-Einstellungen, kein Sidecar-Neustart)
+  rememberLastDevice: true,
+  autoConnect: false,
+  startMinimized: false,
+  trayIcon: false,
+  debugLogging: false,
+
+  // Interner UI-Zustand
+  activeTab: 'connect',
+  lastDevice: null, // { name, ip, port } - nur gesetzt, wenn rememberLastDevice aktiv ist
 };
 
 const BACKGROUND_COLOR = '#0f1417';
@@ -45,9 +79,14 @@ const BACKGROUND_COLOR = '#0f1417';
 // ---------------------------------------------------------------------------
 
 let mainWindow = null;
-let statusPollTimer = null;
+let statusPollTimer = null; // setTimeout-Kette (dynamisches Intervall, siehe startStatusPolling)
+let statusPollActive = false;
+let statusPollInFlight = false; // Overlap-Schutz: ein Tick wird übersprungen, solange der vorige noch offen ist
+let devicesPollTimer = null; // eigener setInterval, entkoppelt vom status-Poll
 let settings = { ...DEFAULT_SETTINGS };
 let lastSidecarError = null;
+let tray = null;
+let logStream = null;
 
 /**
  * TCP-Client-Verbindung zum Audio-Port des Go-Sidecars (127.0.0.1:7655).
@@ -64,6 +103,7 @@ const audioBridge = {
   reconnectDelay: AUDIO_RECONNECT_MIN_MS,
   writable: false, // false während socket.write() zuletzt Rückstau meldete
   state: 'disconnected', // 'disconnected' | 'connecting' | 'connected' | 'error'
+  droppedChunks: 0, // Blöcke, die verworfen wurden (keine Verbindung/Rückstau/Größenlimit) - siehe writeAudioChunk
 };
 
 const sidecar = {
@@ -86,6 +126,21 @@ function settingsFilePath() {
   return path.join(app.getPath('userData'), SETTINGS_FILE);
 }
 
+function logDirPath() {
+  return path.join(app.getPath('userData'), 'logs');
+}
+
+/** Öffnet (bzw. legt neu an) die Log-Datei, in die Sidecar-stdout/stderr fortlaufend gespiegelt wird. */
+function openLogStream() {
+  try {
+    fs.mkdirSync(logDirPath(), { recursive: true });
+    logStream = fs.createWriteStream(path.join(logDirPath(), 'sidecar.log'), { flags: 'a' });
+  } catch (err) {
+    console.error('[log] Konnte Log-Datei nicht öffnen:', err);
+    logStream = null;
+  }
+}
+
 function loadSettings() {
   try {
     const raw = fs.readFileSync(settingsFilePath(), 'utf-8');
@@ -106,12 +161,33 @@ function persistSettings() {
   }
 }
 
+/** Ganzzahl aus src[key] im Bereich [min,max], sonst fallback. */
+function sanitizeIntInRange(src, key, min, max, fallback) {
+  const n = Math.trunc(Number(src[key]));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function sanitizeEnum(src, key, allowed, fallback) {
+  return allowed.includes(src[key]) ? src[key] : fallback;
+}
+
+/** Validiert ein gemerktes Gerät ({name, ip, port}) oder gibt null zurück. */
+function sanitizeLastDevice(value) {
+  if (!value || typeof value !== 'object') return null;
+  const ip = typeof value.ip === 'string' ? value.ip.trim() : '';
+  if (!isValidHost(ip)) return null;
+  const port = isValidPort(value.port) ? Number(value.port) : 7000;
+  const name = typeof value.name === 'string' ? value.name.trim().slice(0, 128) : ip;
+  return { name: name || ip, ip, port };
+}
+
 function sanitizeSettings(input) {
   const src = input && typeof input === 'object' ? input : {};
 
-  const fps = [30, 60].includes(Number(src.fps)) ? Number(src.fps) : DEFAULT_SETTINGS.fps;
+  const fps = [24, 30, 45, 60].includes(Number(src.fps)) ? Number(src.fps) : DEFAULT_SETTINGS.fps;
 
-  const allowedHeights = [0, 720, 1080];
+  const allowedHeights = [0, 720, 1080, 1440];
   const maxHeight = allowedHeights.includes(Number(src.maxHeight))
     ? Number(src.maxHeight)
     : DEFAULT_SETTINGS.maxHeight;
@@ -125,17 +201,70 @@ function sanitizeSettings(input) {
 
   const audioEnabled = src.audioEnabled === true;
 
-  return { fps, maxHeight, outputIndex, bitrate, audioEnabled };
+  const preset = sanitizeEnum(src, 'preset', ['lowest_latency', 'balanced', 'best_quality', 'custom'], DEFAULT_SETTINGS.preset);
+  const expertMode = src.expertMode === true;
+
+  const targetLatencyMs = sanitizeIntInRange(src, 'targetLatencyMs', 5, 2000, DEFAULT_SETTINGS.targetLatencyMs);
+  const gopSeconds = sanitizeIntInRange(src, 'gopSeconds', 1, 10, DEFAULT_SETTINGS.gopSeconds);
+  const rateControl = sanitizeEnum(src, 'rateControl', ['display_remoting', 'cbr_live'], DEFAULT_SETTINGS.rateControl);
+  const hwaccel = sanitizeEnum(src, 'hwaccel', ['auto', 'none'], DEFAULT_SETTINGS.hwaccel);
+  const audioBufferMs = sanitizeIntInRange(src, 'audioBufferMs', 40, 500, DEFAULT_SETTINGS.audioBufferMs);
+
+  const showCursor = src.showCursor !== false; // Default true
+
+  const rememberLastDevice = src.rememberLastDevice !== false; // Default true
+  const autoConnect = src.autoConnect === true;
+  const startMinimized = src.startMinimized === true;
+  const trayIcon = src.trayIcon === true;
+  const debugLogging = src.debugLogging === true;
+
+  const activeTab = sanitizeEnum(src, 'activeTab', ['connect', 'stats', 'settings'], DEFAULT_SETTINGS.activeTab);
+  const lastDevice = rememberLastDevice ? sanitizeLastDevice(src.lastDevice) : null;
+
+  return {
+    fps,
+    maxHeight,
+    outputIndex,
+    bitrate,
+    audioEnabled,
+    preset,
+    expertMode,
+    targetLatencyMs,
+    gopSeconds,
+    rateControl,
+    hwaccel,
+    audioBufferMs,
+    showCursor,
+    rememberLastDevice,
+    autoConnect,
+    startMinimized,
+    trayIcon,
+    debugLogging,
+    activeTab,
+    lastDevice,
+  };
 }
 
-/** Vergleicht nur die Felder, die den Sidecar-Neustart erzwingen. */
+/**
+ * Vergleicht nur die Felder, die tatsächlich in buildSidecarArgs landen und
+ * damit einen Sidecar-Neustart erzwingen. Reine UI-Einstellungen (Preset-
+ * Auswahl, Expertenmodus, gemerktes Gerät, aktiver Tab, ...) lösen bewusst
+ * KEINEN Neustart aus.
+ */
 function daemonFlagsChanged(a, b) {
   return (
     a.fps !== b.fps ||
     a.maxHeight !== b.maxHeight ||
     a.outputIndex !== b.outputIndex ||
     a.bitrate !== b.bitrate ||
-    a.audioEnabled !== b.audioEnabled
+    a.audioEnabled !== b.audioEnabled ||
+    a.targetLatencyMs !== b.targetLatencyMs ||
+    a.gopSeconds !== b.gopSeconds ||
+    a.rateControl !== b.rateControl ||
+    a.hwaccel !== b.hwaccel ||
+    a.audioBufferMs !== b.audioBufferMs ||
+    a.showCursor !== b.showCursor ||
+    a.debugLogging !== b.debugLogging
   );
 }
 
@@ -350,7 +479,10 @@ function syncAudioBridgeWanted() {
  */
 function writeAudioChunk(buffer) {
   const socket = audioBridge.socket;
-  if (!socket || socket.destroyed || !audioBridge.writable) return;
+  if (!socket || socket.destroyed || !audioBridge.writable) {
+    audioBridge.droppedChunks += 1;
+    return;
+  }
   const ok = socket.write(buffer);
   if (!ok) audioBridge.writable = false;
 }
@@ -392,6 +524,18 @@ function buildSidecarArgs(s) {
   args.push('-max-height', String(s.maxHeight));
   if (s.bitrate && s.bitrate > 0) {
     args.push('-bitrate', String(s.bitrate));
+  }
+  args.push('-target-latency-ms', String(s.targetLatencyMs));
+  args.push('-gop-seconds', String(s.gopSeconds));
+  args.push('-rate-control', String(s.rateControl));
+  args.push('-hwaccel', String(s.hwaccel));
+  args.push('-audio-buffer-ms', String(s.audioBufferMs));
+  if (s.showCursor === false) {
+    // Invertierte Logik: das Flag heißt "-no-cursor" und hat keinen Wert.
+    args.push('-no-cursor');
+  }
+  if (s.debugLogging) {
+    args.push('-debug');
   }
   return args;
 }
@@ -448,8 +592,14 @@ async function spawnSidecarProcess(currentSettings) {
   });
   sidecar.child = child;
 
-  child.stdout.on('data', (d) => process.stdout.write(`[luftspiegel] ${d}`));
-  child.stderr.on('data', (d) => process.stderr.write(`[luftspiegel:err] ${d}`));
+  child.stdout.on('data', (d) => {
+    process.stdout.write(`[luftspiegel] ${d}`);
+    if (logStream) logStream.write(d);
+  });
+  child.stderr.on('data', (d) => {
+    process.stderr.write(`[luftspiegel:err] ${d}`);
+    if (logStream) logStream.write(d);
+  });
 
   child.once('exit', (code, signal) => {
     const wasStopping = sidecar.stopping;
@@ -683,20 +833,67 @@ function reportSidecarError(message) {
   notifyRenderer('sidecar:error', { message });
 }
 
-function startStatusPolling() {
-  stopStatusPolling();
-  statusPollTimer = setInterval(async () => {
-    if (!sidecar.child && !sidecar.adopted) return; // kein Sidecar erreichbar -> nichts zu pollen
-    try {
-      const result = await sendControlCommand({ cmd: 'status' }, DEFAULT_TIMEOUT_MS);
-      notifyRenderer('mirror:status', result);
-    } catch (err) {
-      notifyRenderer('mirror:status', { ok: false, error: err.message });
-    }
+/**
+ * Fragt "status" per selbst-nachplanendem setTimeout ab (statt setInterval),
+ * weil das Intervall dynamisch ist: 1s solange gestreamt wird (der
+ * Statistik-Tab will frische Werte), sonst 2s. sendControlCommand() öffnet
+ * pro Aufruf eine neue TCP-Verbindung - bei 1s Intervall und einem 3s-
+ * Timeout (DEFAULT_TIMEOUT_MS) würden sich Ticks sonst stapeln, deshalb der
+ * statusPollInFlight-Guard: ein neuer Tick wird übersprungen, solange der
+ * vorige noch offen ist, statt eine zweite Verbindung parallel aufzumachen.
+ */
+function scheduleNextStatusPoll(delayMs) {
+  if (!statusPollActive) return;
+  statusPollTimer = setTimeout(statusPollTick, delayMs);
+}
 
-    // Zusätzlich die Geräteliste aus dem Cache aktualisieren (billiger
-    // "devices"-Aufruf), damit später gefundene Geräte im Hintergrund
-    // nachgetragen werden - OHNE erneut einen "discover"-Scan auszulösen.
+async function statusPollTick() {
+  statusPollTimer = null;
+  if (!statusPollActive) return;
+
+  if (!sidecar.child && !sidecar.adopted) {
+    scheduleNextStatusPoll(STATUS_POLL_INTERVAL_IDLE_MS);
+    return; // kein Sidecar erreichbar -> nichts zu pollen
+  }
+  if (statusPollInFlight) {
+    scheduleNextStatusPoll(STATUS_POLL_INTERVAL_IDLE_MS);
+    return;
+  }
+
+  statusPollInFlight = true;
+  let nextDelay = STATUS_POLL_INTERVAL_IDLE_MS;
+  try {
+    const result = await sendControlCommand({ cmd: 'status' }, DEFAULT_TIMEOUT_MS);
+    // Zähler für verworfene Audio-Chunks huckepack auf den ohnehin
+    // laufenden status-Push legen (kein eigener Kanal nötig) - so kommt er
+    // im selben Rhythmus wie alle anderen Live-Werte im Statistik-Tab an.
+    if (result && typeof result === 'object') {
+      result.guiAudioDropped = audioBridge.droppedChunks;
+    }
+    notifyRenderer('mirror:status', result);
+    // "stats" ist laut Daemon-Vertrag nur gesetzt, während gestreamt wird -
+    // daran (statt am Text von "state") hängt das schnellere Poll-Intervall.
+    if (result && result.stats) {
+      nextDelay = STATUS_POLL_INTERVAL_STREAMING_MS;
+    }
+  } catch (err) {
+    notifyRenderer('mirror:status', { ok: false, error: err.message, guiAudioDropped: audioBridge.droppedChunks });
+  } finally {
+    statusPollInFlight = false;
+  }
+  scheduleNextStatusPoll(nextDelay);
+}
+
+/**
+ * Aktualisiert die Geräteliste aus dem Cache (billiger "devices"-Aufruf),
+ * damit später gefundene Geräte im Hintergrund nachgetragen werden - OHNE
+ * erneut einen "discover"-Scan auszulösen. Bewusst als eigener setInterval
+ * mit festen 2s entkoppelt vom (dynamischen) status-Poll.
+ */
+function startDevicesPolling() {
+  stopDevicesPolling();
+  devicesPollTimer = setInterval(async () => {
+    if (!sidecar.child && !sidecar.adopted) return;
     try {
       const devicesResult = await sendControlCommand({ cmd: 'devices' }, DEFAULT_TIMEOUT_MS);
       notifyRenderer('device:updated', devicesResult);
@@ -704,14 +901,112 @@ function startStatusPolling() {
       // Stiller Fehlschlag - ein Hintergrund-Refresh der Geräteliste soll
       // keine Fehlermeldung auslösen, die Liste bleibt einfach wie sie ist.
     }
-  }, STATUS_POLL_INTERVAL_MS);
+  }, DEVICES_POLL_INTERVAL_MS);
+}
+
+function stopDevicesPolling() {
+  if (devicesPollTimer) {
+    clearInterval(devicesPollTimer);
+    devicesPollTimer = null;
+  }
+}
+
+function startStatusPolling() {
+  stopStatusPolling();
+  statusPollActive = true;
+  scheduleNextStatusPoll(0);
+  startDevicesPolling();
 }
 
 function stopStatusPolling() {
+  statusPollActive = false;
   if (statusPollTimer) {
-    clearInterval(statusPollTimer);
+    clearTimeout(statusPollTimer);
     statusPollTimer = null;
   }
+  statusPollInFlight = false;
+  stopDevicesPolling();
+}
+
+// ---------------------------------------------------------------------------
+// Tray-Icon
+// ---------------------------------------------------------------------------
+
+/**
+ * Baut ein winziges 16x16-Tray-Icon (gefüllter Kreis in Akzentfarbe) direkt
+ * als rohes BGRA-Bitmap, statt eine Icon-Datei ins Repo zu legen - das
+ * Projekt hat bislang keinerlei Bildassets und die CSP betrifft ohnehin nur
+ * den Renderer-Prozess, hier ist das kein Sicherheitsthema.
+ */
+function buildTrayIcon() {
+  const size = 16;
+  const buf = Buffer.alloc(size * size * 4);
+  const cx = (size - 1) / 2;
+  const cy = (size - 1) / 2;
+  const r = size / 2 - 1;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      const dx = x - cx;
+      const dy = y - cy;
+      if (dx * dx + dy * dy <= r * r) {
+        // Bitmap-Reihenfolge ist BGRA - Akzentfarbe #2fd3c4 (R=0x2f G=0xd3 B=0xc4).
+        buf[i] = 0xc4;
+        buf[i + 1] = 0xd3;
+        buf[i + 2] = 0x2f;
+        buf[i + 3] = 0xff;
+      }
+    }
+  }
+  return nativeImage.createFromBuffer(buf, { width: size, height: size });
+}
+
+function createTray() {
+  if (tray) return;
+  tray = new Tray(buildTrayIcon());
+  tray.setToolTip('Luftspiegel');
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      {
+        label: 'Öffnen',
+        click: () => {
+          if (mainWindow) {
+            mainWindow.show();
+            mainWindow.focus();
+          }
+        },
+      },
+      { type: 'separator' },
+      {
+        // app.quit() (NICHT app.exit()/mainWindow.destroy()) - das ist der
+        // einzige Weg, der zuverlässig durch den before-quit-Handler läuft
+        // und damit vor dem Beenden ein sauberes RTSP-TEARDOWN auslöst.
+        label: 'Beenden',
+        click: () => app.quit(),
+      },
+    ])
+  );
+  tray.on('click', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isVisible()) mainWindow.hide();
+    else {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+}
+
+function destroyTray() {
+  if (tray) {
+    tray.destroy();
+    tray = null;
+  }
+}
+
+/** Erzeugt/entfernt das Tray-Icon passend zu settings.trayIcon. */
+function syncTray() {
+  if (settings.trayIcon) createTray();
+  else destroyTray();
 }
 
 // ---------------------------------------------------------------------------
@@ -723,9 +1018,10 @@ function createWindow() {
     width: 1080,
     height: 720,
     minWidth: 860,
-    minHeight: 600,
+    minHeight: 640,
     backgroundColor: BACKGROUND_COLOR,
     autoHideMenuBar: true,
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -743,6 +1039,30 @@ function createWindow() {
       console.log(`[renderer] ${message} (${sourceId}:${line})`);
     });
   }
+
+  mainWindow.once('ready-to-show', () => {
+    if (settings.startMinimized) {
+      // Bei aktivem Tray-Icon direkt versteckt starten (das Fenster ist ja
+      // jederzeit übers Tray erreichbar); ohne Tray gäbe es sonst keinen Weg
+      // zurück, daher dort nur minimieren statt verstecken.
+      if (settings.trayIcon) mainWindow.hide();
+      else mainWindow.minimize();
+    } else {
+      mainWindow.show();
+    }
+  });
+
+  // Mit aktivem Tray-Icon wird "Fenster schließen" zu "verstecken" statt zu
+  // "beenden" - das eigentliche Beenden läuft ausschließlich über
+  // app.quit() (Tray-Menü "Beenden" oder z.B. Task-Leiste), das den
+  // before-quit-Handler unten (mit dem sauberen TEARDOWN) durchläuft. Ohne
+  // Tray bleibt das bisherige Verhalten (Schließen = Beenden) unverändert.
+  mainWindow.on('close', (event) => {
+    if (settings.trayIcon && !quitting) {
+      event.preventDefault();
+      mainWindow.hide();
+    }
+  });
 
   mainWindow.on('closed', () => {
     mainWindow = null;
@@ -833,12 +1153,14 @@ function registerIpcHandlers() {
 
   ipcMain.handle('mirror:status', async () => {
     if (!sidecar.child && !sidecar.adopted) {
-      return { ok: true, state: 'getrennt' };
+      return { ok: true, state: 'getrennt', guiAudioDropped: audioBridge.droppedChunks };
     }
     try {
-      return await sendControlCommand({ cmd: 'status' }, DEFAULT_TIMEOUT_MS);
+      const result = await sendControlCommand({ cmd: 'status' }, DEFAULT_TIMEOUT_MS);
+      if (result && typeof result === 'object') result.guiAudioDropped = audioBridge.droppedChunks;
+      return result;
     } catch (err) {
-      return { ok: false, error: err.message };
+      return { ok: false, error: err.message, guiAudioDropped: audioBridge.droppedChunks };
     }
   });
 
@@ -861,7 +1183,7 @@ function registerIpcHandlers() {
    * ist). Der Renderer fragt diesen Zustand daher beim Start zusätzlich
    * aktiv ab, statt sich allein auf den Push zu verlassen.
    */
-  ipcMain.handle('audio:statusGet', async () => ({ state: audioBridge.state }));
+  ipcMain.handle('audio:statusGet', async () => ({ state: audioBridge.state, droppedChunks: audioBridge.droppedChunks }));
 
   ipcMain.handle('settings:get', async () => {
     return settings;
@@ -872,6 +1194,7 @@ function registerIpcHandlers() {
     const newSettings = sanitizeSettings(payload);
     settings = newSettings;
     persistSettings();
+    syncTray(); // trayIcon ist eine reine UI-Einstellung, aber muss sofort wirken
 
     try {
       const { restarted, note } = await applySettingsRestartIfNeeded(oldSettings, newSettings);
@@ -892,9 +1215,26 @@ function registerIpcHandlers() {
   ipcMain.on('audio:chunk', (_event, payload) => {
     if (!(payload instanceof ArrayBuffer)) return;
     // Plausibilitätsdeckel: bei 20ms Batches sind das ~3528 Byte; alles
-    // jenseits von 64 KiB ist mit Sicherheit keine gültige Nachricht.
-    if (payload.byteLength === 0 || payload.byteLength > 65536) return;
+    // jenseits von 64 KiB ist mit Sicherheit keine gültige Nachricht - wird
+    // (wie jeder andere verworfene Block auch) mitgezählt.
+    if (payload.byteLength === 0 || payload.byteLength > 65536) {
+      audioBridge.droppedChunks += 1;
+      return;
+    }
     writeAudioChunk(Buffer.from(payload));
+  });
+
+  // Öffnet das Verzeichnis, in das Sidecar-stdout/stderr gespiegelt werden
+  // (siehe openLogStream/spawnSidecarProcess), im System-Dateimanager.
+  ipcMain.handle('logs:open', async () => {
+    try {
+      fs.mkdirSync(logDirPath(), { recursive: true });
+      const err = await shell.openPath(logDirPath());
+      if (err) return { ok: false, error: err };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
   });
 }
 
@@ -906,6 +1246,7 @@ let quitting = false;
 
 async function cleanShutdown() {
   stopStatusPolling();
+  destroyTray();
   try {
     await stopSidecarClean();
   } catch (err) {
@@ -920,14 +1261,17 @@ if (!gotLock) {
   app.on('second-instance', () => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
       mainWindow.focus();
     }
   });
 
   app.whenReady().then(async () => {
     loadSettings();
+    openLogStream();
     registerIpcHandlers();
     registerDisplayMediaHandler();
+    syncTray();
     createWindow();
 
     screen.on('display-added', broadcastDisplays);
@@ -942,6 +1286,11 @@ if (!gotLock) {
   });
 
   app.on('window-all-closed', () => {
+    // Mit aktivem Tray-Icon läuft die App im Hintergrund weiter (das
+    // Fenster wurde nur versteckt, siehe mainWindow.on('close', ...) in
+    // createWindow) - "window-all-closed" darf sie dann NICHT beenden,
+    // sonst würde eine laufende Sitzung ohne TEARDOWN gekillt.
+    if (settings.trayIcon) return;
     if (process.platform !== 'darwin') {
       app.quit();
     }
@@ -950,9 +1299,18 @@ if (!gotLock) {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
+    } else if (mainWindow) {
+      mainWindow.show();
     }
   });
 
+  // Zentraler Ausstiegspunkt für JEDEN Beendigungsweg (Fenster-X ohne Tray,
+  // Tray-Menü "Beenden", Task-Leiste, Alt+F4, ...): app.quit() (oder das
+  // native Beenden) löst 'before-quit' aus, bevor der Prozess wirklich
+  // stirbt. Hier wird das Beenden verzögert (preventDefault), bis
+  // stopSidecarClean() das RTSP-TEARDOWN sauber abgeschickt hat - erst
+  // danach beendet app.exit(0) den Prozess wirklich. Es gibt bewusst
+  // keinen zweiten Pfad, der den Prozess direkt beendet.
   app.on('before-quit', (event) => {
     if (quitting) return;
     event.preventDefault();

@@ -42,6 +42,9 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error
 	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, err
 	}
+	if err := ValidateRateControl(cfg.RateControl); err != nil {
+		return nil, err
+	}
 	if cfg.StubFile != "" {
 		return StartStubCapture(ctx, cfg)
 	}
@@ -56,10 +59,11 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error
 		fps = 30
 	}
 	bitrate := windowsBitrateKbps(cfg.Bitrate)
-	encoderArgs, err := windowsEncoderArgs(cfg.HWAccel, bitrate)
+	encoderArgs, err := windowsEncoderArgs(cfg.HWAccel, cfg.RateControl, bitrate)
 	if err != nil {
 		return nil, err
 	}
+	gopSeconds := windowsGOPSeconds(cfg.GOPSeconds)
 
 	drawMouse := 0
 	if cfg.ShowCursor {
@@ -76,10 +80,18 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error
 		"-filter_complex", filter,
 	}
 	args = append(args, encoderArgs...)
-	args = append(args, "-g", strconv.Itoa(fps), "-fps_mode", "cfr", "-f", "h264", "pipe:1")
+	// -flush_packets 1: without it the raw h264 muxer buffers writes behind a
+	// 32KB AVIO buffer, so a small P-frame can sit there undelivered until a
+	// later frame pushes it out — up to a full frame of added latency.
+	args = append(args, "-g", strconv.Itoa(gopSeconds*fps), "-fps_mode", "cfr", "-flush_packets", "1", "-f", "h264", "pipe:1")
 
 	dbg("[CAPTURE] %s %s", ffmpegPath, strings.Join(args, " "))
-	return startFFmpegCapture(ctx, ffmpegPath, args)
+	sc, err := startFFmpegCapture(ctx, ffmpegPath, args)
+	if err != nil {
+		return nil, err
+	}
+	sc.encoderName, sc.rateControlName = windowsEncoderNames(cfg.HWAccel, cfg.RateControl)
+	return sc, nil
 }
 
 // StartTestCapture creates a synthetic H.264 stream (ffmpeg's lavfi testsrc2)
@@ -87,6 +99,9 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error
 // videotestsrc path, used for the -test flag and daemon test mode.
 func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
 	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
+		return nil, err
+	}
+	if err := ValidateRateControl(cfg.RateControl); err != nil {
 		return nil, err
 	}
 	if cfg.StubFile != "" {
@@ -103,10 +118,11 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 		fps = 30
 	}
 	bitrate := windowsBitrateKbps(cfg.Bitrate)
-	encoderArgs, err := windowsEncoderArgs(cfg.HWAccel, bitrate)
+	encoderArgs, err := windowsEncoderArgs(cfg.HWAccel, cfg.RateControl, bitrate)
 	if err != nil {
 		return nil, err
 	}
+	gopSeconds := windowsGOPSeconds(cfg.GOPSeconds)
 
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
@@ -114,10 +130,15 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 		"-vf", "format=nv12",
 	}
 	args = append(args, encoderArgs...)
-	args = append(args, "-g", strconv.Itoa(fps), "-fps_mode", "cfr", "-f", "h264", "pipe:1")
+	args = append(args, "-g", strconv.Itoa(gopSeconds*fps), "-fps_mode", "cfr", "-flush_packets", "1", "-f", "h264", "pipe:1")
 
 	dbg("[CAPTURE] launching %s (test mode) %s", ffmpegPath, strings.Join(args, " "))
-	return startFFmpegCapture(ctx, ffmpegPath, args)
+	sc, err := startFFmpegCapture(ctx, ffmpegPath, args)
+	if err != nil {
+		return nil, err
+	}
+	sc.encoderName, sc.rateControlName = windowsEncoderNames(cfg.HWAccel, cfg.RateControl)
+	return sc, nil
 }
 
 // windowsBitrateKbps applies the CaptureConfig.Bitrate override (0 = auto) and
@@ -147,15 +168,21 @@ func windowsBitrateKbps(bitrate int) int {
 // error. ValidateHWAccel intentionally still accepts all of them so its
 // Linux behavior (and the -hwaccel flag's shared help text) is unchanged —
 // only StartCapture/StartTestCapture reject the Windows-unsupported values.
-func windowsEncoderArgs(hwaccel string, bitrateKbps int) ([]string, error) {
+//
+// rateControl only affects the h264_mf path: "cbr_live" asks the Qualcomm
+// MFT for -rate_control cbr -scenario live_streaming instead of the default
+// -scenario display_remoting. It has no effect on the libx264 path, which
+// already runs zerolatency/ultrafast unconditionally.
+func windowsEncoderArgs(hwaccel, rateControl string, bitrateKbps int) ([]string, error) {
 	switch hwaccel {
 	case "", "auto":
-		return []string{
-			"-c:v", "h264_mf",
-			"-hw_encoding", "1",
-			"-scenario", "display_remoting",
-			"-b:v", fmt.Sprintf("%dk", bitrateKbps),
-		}, nil
+		args := []string{"-c:v", "h264_mf", "-hw_encoding", "1"}
+		if rateControl == "cbr_live" {
+			args = append(args, "-rate_control", "cbr", "-scenario", "live_streaming")
+		} else {
+			args = append(args, "-scenario", "display_remoting")
+		}
+		return append(args, "-b:v", fmt.Sprintf("%dk", bitrateKbps)), nil
 	case "none":
 		return []string{
 			"-c:v", "libx264",
@@ -168,6 +195,38 @@ func windowsEncoderArgs(hwaccel string, bitrateKbps int) ([]string, error) {
 	default:
 		// ValidateHWAccel rejects anything else before this is reached.
 		return nil, fmt.Errorf("unsupported -hwaccel %q on Windows", hwaccel)
+	}
+}
+
+// windowsGOPSeconds applies the CaptureConfig.GOPSeconds override (0 =
+// default) and clamps it to [minGOPSeconds, maxGOPSeconds].
+func windowsGOPSeconds(gopSeconds int) int {
+	if gopSeconds <= 0 {
+		return defaultGOPSeconds
+	}
+	if gopSeconds < minGOPSeconds {
+		return minGOPSeconds
+	}
+	if gopSeconds > maxGOPSeconds {
+		return maxGOPSeconds
+	}
+	return gopSeconds
+}
+
+// windowsEncoderNames mirrors the selection logic in windowsEncoderArgs to
+// report which encoder/rate-control strategy is actually in effect, for the
+// capture layer to hand to a session's stats collector.
+func windowsEncoderNames(hwaccel, rateControl string) (encoder, rateControlName string) {
+	switch hwaccel {
+	case "", "auto":
+		if rateControl == "cbr_live" {
+			return "h264_mf", "cbr_live"
+		}
+		return "h264_mf", "display_remoting"
+	case "none":
+		return "libx264", ""
+	default:
+		return "", ""
 	}
 }
 

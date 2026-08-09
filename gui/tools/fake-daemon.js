@@ -48,6 +48,82 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ---------------------------------------------------------------------------
+// stats-Simulation (siehe GUI-Vertrag: stats.history in 500ms-Auflösung,
+// bis zu 120 Punkte = 60s, ältester zuerst). Läuft als eigener Timer,
+// solange mindestens ein Stream aktiv ist, damit der Statistik-Tab der GUI
+// auch ohne echten Go-Daemon plausible, sich leicht ändernde Werte zum
+// Testen bekommt.
+let statsHistory = [];
+let statsTimer = null;
+let statsStartedAt = null;
+
+function statsSample() {
+  const fps = 28 + Math.random() * 4;
+  const bitrate_kbps = 3800 + Math.random() * 1200;
+  const au_hold_ms = 4 + Math.random() * 8;
+  return {
+    fps: Number(fps.toFixed(1)),
+    bitrate_kbps: Number(bitrate_kbps.toFixed(1)),
+    au_hold_ms: Number(au_hold_ms.toFixed(1)),
+  };
+}
+
+function startStatsSimulation() {
+  if (statsTimer) return;
+  statsStartedAt = Date.now();
+  statsHistory = [];
+  statsTimer = setInterval(() => {
+    statsHistory.push(statsSample());
+    if (statsHistory.length > 120) statsHistory.shift();
+  }, 500);
+}
+
+function stopStatsSimulation() {
+  if (statsTimer) {
+    clearInterval(statsTimer);
+    statsTimer = null;
+  }
+  statsHistory = [];
+  statsStartedAt = null;
+}
+
+/** Baut einen kompletten stats-Block nach dem in der GUI dokumentierten Schema, oder null ohne aktiven Stream. */
+function buildStats() {
+  if (!statsStartedAt) return null;
+  const uptime_sec = (Date.now() - statsStartedAt) / 1000;
+  const latest = statsHistory.length ? statsHistory[statsHistory.length - 1] : statsSample();
+  const bytesPerSec = (latest.bitrate_kbps * 1000) / 8;
+
+  return {
+    uptime_sec: Number(uptime_sec.toFixed(1)),
+    frames_sent: Math.round(uptime_sec * latest.fps),
+    keyframes: Math.max(1, Math.round(uptime_sec / 4)),
+    bytes_sent: Math.round(bytesPerSec * uptime_sec),
+    fps: latest.fps,
+    bitrate_kbps: latest.bitrate_kbps,
+    au_hold_ms_p50: latest.au_hold_ms,
+    au_hold_ms_p95: Number((latest.au_hold_ms * 1.8).toFixed(1)),
+    socket_write_ms_p50: 0.4,
+    socket_write_ms_p95: 2.9,
+    rtt_ms: Number((2 + Math.random() * 3).toFixed(1)),
+    receiver_render_latency_ms: 62.0,
+    audio_frames_sent: Math.round(uptime_sec * 50),
+    audio_buffer_ms: 118.3,
+    audio_underruns: 2,
+    audio_silence_ms: 41.0,
+    audio_drain_ms: 180.0,
+    width: 1728,
+    height: 1080,
+    encoder: 'h264_mf',
+    rate_control: 'display_remoting',
+    target_latency_ms: 100,
+    // ältester zuerst, wie vom Daemon-Vertrag gefordert - statsHistory wird
+    // in derselben Reihenfolge (push ans Ende) aufgebaut.
+    history: statsHistory.slice(),
+  };
+}
+
 function baseResponse(extra) {
   return Object.assign(
     {
@@ -61,6 +137,10 @@ function baseResponse(extra) {
       error: '',
       devices: FAKE_DEVICES,
       streams,
+      // Bewusst undefined statt null, wenn kein Stream aktiv ist -
+      // JSON.stringify lässt undefined-Felder ganz weg, das Feld fehlt dann
+      // komplett in der Antwort (siehe Vertrag: "fehlt das Feld").
+      stats: streams.length ? buildStats() : undefined,
     },
     extra
   );
@@ -110,6 +190,7 @@ function handleCommand(cmd) {
 
       streams = streams.filter((s) => s.device_ip !== target);
       streams.push({ device: dev.name || target, device_ip: target, state: 'verbunden', has_audio: false, audio_muted: false });
+      startStatsSimulation();
 
       return baseResponse({ state: 'verbunden', device: dev.name || target, device_ip: target });
     }
@@ -120,6 +201,7 @@ function handleCommand(cmd) {
       } else {
         streams = [];
       }
+      if (streams.length === 0) stopStatsSimulation();
       return baseResponse({ state: 'getrennt', device: '', device_ip: '' });
     }
 

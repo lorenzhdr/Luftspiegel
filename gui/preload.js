@@ -41,5 +41,10 @@ contextBridge.exposeInMainWorld('luftspiegel', {
     // Pull-Fallback für den aktuellen Bridge-Zustand (siehe main.js).
     status: () => ipcRenderer.invoke('audio:statusGet'),
   },
+  logs: {
+    // Öffnet das Verzeichnis mit der gespiegelten Sidecar-Log-Datei im
+    // System-Dateimanager (shell.openPath läuft im Main-Prozess).
+    open: () => ipcRenderer.invoke('logs:open'),
+  },
   on,
 });

@@ -42,6 +42,13 @@ type CaptureConfig struct {
 	// EOF. Intended for exercising the mirror/streaming pipeline without a
 	// working capture backend. See StartStubCapture.
 	StubFile string
+
+	// GOPSeconds is the keyframe interval in seconds. 0 selects the default.
+	GOPSeconds int
+	// RateControl selects the h264_mf rate-control strategy:
+	// "" or "display_remoting" (default), or "cbr_live" for
+	// -rate_control cbr -scenario live_streaming.
+	RateControl string
 }
 
 // ValidateHWAccel checks a capture encoder preference. An empty value keeps the
@@ -60,11 +67,28 @@ const (
 	minVideoBitrateKbps     = 1800
 	maxVideoBitrateKbps     = 12000
 
+	// GOP length bounds, in seconds, for CaptureConfig.GOPSeconds.
+	minGOPSeconds     = 1
+	maxGOPSeconds     = 10
+	defaultGOPSeconds = 4
+
 	// Synthetic test capture has no real display to size itself from, so it
 	// uses a fixed resolution.
 	testCaptureWidth  = 1920
 	testCaptureHeight = 1080
 )
+
+// ValidateRateControl checks a capture rate-control preference. An empty
+// value keeps the zero-value CaptureConfig useful and is treated as the
+// display_remoting default.
+func ValidateRateControl(rateControl string) error {
+	switch rateControl {
+	case "", "display_remoting", "cbr_live":
+		return nil
+	default:
+		return fmt.Errorf("unknown rate control %q (want display_remoting or cbr_live)", rateControl)
+	}
+}
 
 // ScreenCapture manages screen capture. StartCapture, StartTestCapture, and
 // StartStubCapture (Linux/GStreamer, Windows/ffmpeg, and the file-replay stub,
@@ -84,6 +108,26 @@ type ScreenCapture struct {
 	// isn't covered by cancel/stdout/cmd — e.g. closing the Wayland portal's
 	// D-Bus session on Linux. Nil everywhere else.
 	extraClose func()
+
+	// encoderName and rateControlName record which video encoder and
+	// rate-control strategy the platform backend actually launched with, so
+	// the caller can hand it to a session's stats collector (which alone
+	// knows the encoder choice; see StartCapture in capture_windows.go).
+	// Left empty on backends that don't set them.
+	encoderName     string
+	rateControlName string
+}
+
+// EncoderName returns the video encoder actually in use (e.g. "h264_mf" or
+// "libx264"), or "" if the active backend hasn't recorded one.
+func (sc *ScreenCapture) EncoderName() string {
+	return sc.encoderName
+}
+
+// RateControlName returns the rate-control strategy actually in use (e.g.
+// "display_remoting" or "cbr_live"), or "" if not applicable/recorded.
+func (sc *ScreenCapture) RateControlName() string {
+	return sc.rateControlName
 }
 
 func (sc *ScreenCapture) Read(buf []byte) (int, error) {

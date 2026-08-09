@@ -34,7 +34,13 @@
       </div>
     </header>
 
-    <main class="layout">
+    <div class="tabbar" role="tablist" aria-label="Ansicht">
+      <button type="button" class="tab" id="tabBtnConnect" data-tab="connect" role="tab" aria-selected="true" aria-controls="tabConnect" tabindex="0">Verbinden</button>
+      <button type="button" class="tab" id="tabBtnStats" data-tab="stats" role="tab" aria-selected="false" aria-controls="tabStats" tabindex="-1">Statistik</button>
+      <button type="button" class="tab" id="tabBtnSettings" data-tab="settings" role="tab" aria-selected="false" aria-controls="tabSettings" tabindex="-1">Einstellungen</button>
+    </div>
+
+    <main class="layout" id="tabConnect" role="tabpanel" aria-labelledby="tabBtnConnect">
       <section class="panel devices-panel">
         <div class="panel-head">
           <h2>Geräte</h2>
@@ -79,13 +85,146 @@
           <button id="errorBannerDismiss" class="banner-dismiss" type="button" aria-label="Fehlermeldung schließen">&times;</button>
         </div>
         <div id="sidecarBanner" class="banner banner-warn hidden" role="status"></div>
+      </section>
+    </main>
 
-        <div class="settings-card">
-          <h3 class="subhead">Einstellungen</h3>
+    <section class="tabpanel stats-panel hidden" id="tabStats" role="tabpanel" aria-labelledby="tabBtnStats" tabindex="0">
+      <p id="statsEmpty" class="hint stats-empty">Keine aktive Verbindung — Statistiken erscheinen, sobald die Übertragung läuft.</p>
+
+      <div id="statsContent" class="stats-content hidden">
+        <div class="stats-tiles">
+          <div class="stat-tile">
+            <span class="stat-tile-label">Bildrate</span>
+            <span class="stat-tile-value"><span id="statFps">—</span><span class="stat-tile-unit">fps</span></span>
+          </div>
+          <div class="stat-tile">
+            <span class="stat-tile-label">Bitrate</span>
+            <span class="stat-tile-value"><span id="statBitrate">—</span><span id="statBitrateUnit" class="stat-tile-unit">kbit/s</span></span>
+          </div>
+          <div class="stat-tile">
+            <span class="stat-tile-label">Latenz (Apple TV)</span>
+            <span class="stat-tile-value"><span id="statLatency">—</span><span class="stat-tile-unit">ms</span></span>
+          </div>
+          <div class="stat-tile">
+            <span class="stat-tile-label">Sendeverzögerung</span>
+            <span class="stat-tile-value"><span id="statAuHold">—</span><span class="stat-tile-unit">ms</span></span>
+            <span class="stat-tile-sub">p95: <span id="statAuHoldP95">—</span> ms</span>
+          </div>
+          <div class="stat-tile">
+            <span class="stat-tile-label">RTT</span>
+            <span class="stat-tile-value"><span id="statRtt">—</span><span class="stat-tile-unit">ms</span></span>
+          </div>
+          <div class="stat-tile">
+            <span class="stat-tile-label">Laufzeit</span>
+            <span class="stat-tile-value"><span id="statUptime">—</span></span>
+          </div>
+        </div>
+
+        <div class="stats-sparklines">
+          <div class="sparkline-card">
+            <div class="sparkline-head"><span>Bitrate</span><span id="sparkBitrateMax" class="sparkline-max"></span></div>
+            <canvas id="sparkBitrate" class="sparkline-canvas"></canvas>
+          </div>
+          <div class="sparkline-card">
+            <div class="sparkline-head"><span>Sendeverzögerung</span><span id="sparkAuHoldMax" class="sparkline-max"></span></div>
+            <canvas id="sparkAuHold" class="sparkline-canvas"></canvas>
+          </div>
+          <div class="sparkline-card">
+            <div class="sparkline-head"><span>Bildrate</span><span id="sparkFpsMax" class="sparkline-max"></span></div>
+            <canvas id="sparkFps" class="sparkline-canvas"></canvas>
+          </div>
+        </div>
+
+        <div class="stats-table-wrap">
+          <table class="stats-table">
+            <tbody>
+              <tr><th>Auflösung</th><td id="statResolution">—</td></tr>
+              <tr><th>Encoder</th><td id="statEncoder">—</td></tr>
+              <tr><th>Ratenkontrolle</th><td id="statRateControl">—</td></tr>
+              <tr><th>Ziellatenz</th><td id="statTargetLatency">—</td></tr>
+              <tr><th>Gesendete Frames</th><td id="statFramesSent">—</td></tr>
+              <tr><th>Keyframes</th><td id="statKeyframes">—</td></tr>
+              <tr><th>Übertragene Datenmenge</th><td id="statBytesSent">—</td></tr>
+              <tr><th>Audio-Puffer</th><td id="statAudioBufferMs">—</td></tr>
+              <tr><th>Audio-Aussetzer</th><td id="statAudioUnderruns">—</td></tr>
+              <tr><th>Audio-Drain</th><td id="statAudioDrainMs">—</td></tr>
+              <tr><th>Verworfene Audio-Chunks (GUI)</th><td id="statAudioDropped">—</td></tr>
+            </tbody>
+          </table>
+          <p class="hint">Aussetzer, die kontinuierlich mitzählen, bedeuten: der Audio-Puffer ist zu klein eingestellt. Steigt dagegen nur der Drain-Wert, hat sich der Puffer korrekt eingependelt.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="tabpanel settings-panel hidden" id="tabSettings" role="tabpanel" aria-labelledby="tabBtnSettings" tabindex="0">
+      <div class="settings-groups">
+        <fieldset class="settings-group">
+          <legend>Qualitäts-Preset</legend>
+          <div class="settings-grid">
+            <label class="field">
+              <span>Preset</span>
+              <select id="presetSelect">
+                <option value="lowest_latency">Niedrigste Latenz</option>
+                <option value="balanced">Ausgewogen</option>
+                <option value="best_quality">Beste Qualität</option>
+                <option value="custom">Benutzerdefiniert</option>
+              </select>
+            </label>
+            <label class="field checkbox-field">
+              <span>Modus</span>
+              <span class="checkbox-row">
+                <input type="checkbox" id="expertMode" />
+                <span>Expertenmodus (Einzelwerte manuell einstellen)</span>
+              </span>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="settings-group">
+          <legend>Latenz &amp; Encoder</legend>
+          <div class="settings-grid">
+            <label class="field">
+              <span>Bitrate (kbit/s, 0 = automatisch)</span>
+              <input type="number" id="bitrate" min="0" step="500" value="0" />
+            </label>
+            <label class="field">
+              <span>Ziellatenz (ms)</span>
+              <input type="number" id="targetLatencyMs" min="5" max="2000" step="5" value="100" />
+            </label>
+            <label class="field">
+              <span>GOP-Länge (s)</span>
+              <input type="number" id="gopSeconds" min="1" max="10" step="1" value="4" />
+            </label>
+            <label class="field">
+              <span>Ratenkontrolle</span>
+              <select id="rateControl">
+                <option value="display_remoting">Display Remoting</option>
+                <option value="cbr_live">CBR Live</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Hardwarebeschleunigung</span>
+              <select id="hwaccel">
+                <option value="auto">Automatisch (h264_mf)</option>
+                <option value="none">Aus (libx264)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Audio-Puffer (ms)</span>
+              <input type="number" id="audioBufferMs" min="40" max="500" step="10" value="120" />
+            </label>
+          </div>
+          <p class="hint">Nur im Expertenmodus einzeln einstellbar — sonst vom gewählten Preset vorgegeben. Eine manuelle Änderung stellt das Preset auf „Benutzerdefiniert" um.</p>
+        </fieldset>
+
+        <fieldset class="settings-group">
+          <legend>Video</legend>
           <div class="settings-grid">
             <fieldset class="field radio-field" id="fpsField">
               <legend>Bildrate</legend>
+              <label class="radio-label"><input type="radio" name="fps" value="24" /> 24 fps</label>
               <label class="radio-label"><input type="radio" name="fps" value="30" /> 30 fps</label>
+              <label class="radio-label"><input type="radio" name="fps" value="45" /> 45 fps</label>
               <label class="radio-label"><input type="radio" name="fps" value="60" /> 60 fps</label>
             </fieldset>
 
@@ -93,14 +232,10 @@
               <span>Maximale Höhe</span>
               <select id="maxHeight">
                 <option value="0">Nativ</option>
+                <option value="1440">1440p</option>
                 <option value="1080">1080p</option>
                 <option value="720">720p</option>
               </select>
-            </label>
-
-            <label class="field">
-              <span>Bitrate (kbit/s, 0 = automatisch)</span>
-              <input type="number" id="bitrate" min="0" step="500" value="0" />
             </label>
 
             <label class="field">
@@ -109,6 +244,19 @@
             </label>
 
             <label class="field checkbox-field">
+              <span>Mauszeiger</span>
+              <span class="checkbox-row">
+                <input type="checkbox" id="showCursor" />
+                <span>Mauszeiger übertragen</span>
+              </span>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="settings-group">
+          <legend>Ton</legend>
+          <div class="settings-grid">
+            <label class="field checkbox-field">
               <span>Audio</span>
               <span class="checkbox-row">
                 <input type="checkbox" id="audioToggle" />
@@ -116,11 +264,53 @@
               </span>
             </label>
           </div>
-          <p class="hint">Änderungen starten den Sidecar automatisch neu — eine laufende Verbindung wird vorher sauber getrennt.</p>
           <p class="hint">Eigene Töne der App selbst können derzeit mit übertragen werden (Windows-Systembeschränkung dieser Electron-Version) — betrifft nur Klänge, die Luftspiegel selbst abspielt, nicht die Windows-Systemlautstärke.</p>
-        </div>
-      </section>
-    </main>
+        </fieldset>
+
+        <fieldset class="settings-group">
+          <legend>App-Verhalten</legend>
+          <div class="settings-grid">
+            <label class="field checkbox-field">
+              <span>Letztes Gerät</span>
+              <span class="checkbox-row">
+                <input type="checkbox" id="rememberLastDevice" />
+                <span>Letztes verbundenes Gerät merken</span>
+              </span>
+            </label>
+            <label class="field checkbox-field">
+              <span>Autostart</span>
+              <span class="checkbox-row">
+                <input type="checkbox" id="autoConnect" />
+                <span>Beim Start automatisch verbinden</span>
+              </span>
+            </label>
+            <label class="field checkbox-field">
+              <span>Fenster</span>
+              <span class="checkbox-row">
+                <input type="checkbox" id="startMinimized" />
+                <span>Minimiert starten</span>
+              </span>
+            </label>
+            <label class="field checkbox-field">
+              <span>Infobereich</span>
+              <span class="checkbox-row">
+                <input type="checkbox" id="trayIcon" />
+                <span>Symbol im Infobereich (Fenster schließen versteckt statt zu beenden)</span>
+              </span>
+            </label>
+            <label class="field checkbox-field">
+              <span>Diagnose</span>
+              <span class="checkbox-row">
+                <input type="checkbox" id="debugLogging" />
+                <span>Ausführliches Sidecar-Logging</span>
+              </span>
+            </label>
+          </div>
+          <button id="btnOpenLog" class="btn btn-ghost" type="button">Log-Datei öffnen</button>
+          <p class="hint">Änderungen an Bildrate, Auflösung, Monitor, Bitrate, Latenz &amp; Encoder starten den Sidecar automatisch neu — eine laufende Verbindung wird vorher sauber getrennt.</p>
+        </fieldset>
+      </div>
+    </section>
   </div>
 
   <div id="pinOverlay" class="overlay hidden">

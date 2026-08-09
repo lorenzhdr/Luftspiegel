@@ -80,6 +80,10 @@ Relevante Flags (aus `cmd/doubletake/main.go`, nicht abschließend — bei Ände
 | `-hwaccel` | `auto`\|`nvenc`\|`vaapi`\|`openh264`\|`none`; unter Windows sind nur `auto` (h264_mf) und `none` (libx264) tatsächlich verfügbar, die Linux-Encoder-Namen werden mit Fehlermeldung abgelehnt |
 | `-no-audio` | Audio deaktivieren |
 | `-audio-tcp` | Windows: lokaler TCP-Port für PCM-Zulieferung durch die GUI (Default `7655`) |
+| `-audio-buffer-ms` | Windows: Ziel-Füllstand des PCM-Puffers in ms (40–500, 0 = Default 120). **Der dominierende Beitrag zur Audiolatenz** — kleiner = weniger Versatz, aber Risiko hörbarer Aussetzer; die Underrun-Zahl in der Statistik zeigt, ob es zu klein ist |
+| `-gop-seconds` | Keyframe-Intervall in Sekunden (1–10, 0 = Default 4). Früher fix 1 s; große Keyframes im Sekundentakt erzeugen über TCP periodische Sendespitzen |
+| `-rate-control` | `display_remoting` (Default) oder `cbr_live` (= `-rate_control cbr -scenario live_streaming`). CBR glättet die Bitrate |
+| `-target-latency-ms` | Ziellatenz in ms (Default 100), Clamp `[5 ms, 2 s]`. **Achtung:** Der `Audio-Latency`-Header der RECORD-Antwort des Receivers überschreibt das (`mirror.go`), und Receiver ohne FairPlay-SAP erzwingen 500 ms — der tatsächlich wirksame Wert steht in der Statistik unter `target_latency_ms` |
 | `-daemonize` | Als Hintergrunddienst mit Control-Channel starten |
 | `-socket` | Control-Channel-Adresse (Windows: `host:port` oder nackter Port, Default `127.0.0.1:7654`) |
 | `-max-height` | Windows: Downscale-Obergrenze in Pixeln (Höhe), 0 = native Auflösung |
@@ -98,8 +102,12 @@ bin\doubletake-ctl.exe connect 192.168.178.125
 bin\doubletake-ctl.exe disconnect
 ```
 
-`doubletake-ctl`-Kommandos (aus `cmd/doubletake-ctl/main.go`): `status`, `discover`, `devices`, `connect
-[target] [PIN]`, `pin <PIN>`, `disconnect [target]`, `mute [target]`, `unmute [target]`.
+`doubletake-ctl`-Kommandos (aus `cmd/doubletake-ctl/main.go`): `status`, `stats`, `discover`, `devices`,
+`connect [target] [PIN]`, `pin <PIN>`, `disconnect [target]`, `mute [target]`, `unmute [target]`.
+
+`stats` gibt die Verbindungsqualität menschenlesbar aus (Video/Netzwerk/Audio) und ist **das Messwerkzeug
+für Latenz-A/B-Vergleiche** ohne GUI. Wichtigste Zahl: `au hold (send lag)` — die Zeit vom ersten Byte einer
+Access Unit bis zum abgeschlossenen Senden. Ohne aktiven Stream: `not currently streaming`.
 
 ### Electron-GUI
 
@@ -131,6 +139,12 @@ Kein JS-Test-Runner für die GUI im Repo (`gui/package.json` hat keine `test`-Sk
 - `node gui/tools/fake-daemon.js` — simuliert den Go-Daemon-Control-Channel für GUI-Entwicklung ohne
   echten Sidecar.
 - `node gui/tools/pcm-sink.js` — Gegenstück zu `pcmtest`, nimmt PCM vom Audio-Port entgegen.
+- `cd gui && node tools/ui-check.js` — automatisierte GUI-Prüfung ohne Fensterfokus: startet einen eigenen
+  `fake-daemon` und Electron mit `--remote-debugging-port` und isoliertem `--user-data-dir`, treibt die
+  Oberfläche per Chrome-DevTools-Protokoll und prüft Tab-Umschaltung/ARIA, Statistik-Rendering (inkl.
+  `getImageData`-Nachweis, dass die Sparklines wirklich Pixel setzen) sowie Preset-/Expertenmodus-Logik.
+  Exit-Code 0 = alles bestanden. **Keine synthetischen OS-Eingaben** — läuft gefahrlos neben anderen
+  offenen Fenstern.
 - `-stub-file` (CLI-Flag) — spielt eine vorab aufgenommene Annex-B-`.h264`-Datei ab, um die
   Mirror-/Streaming-Pipeline ohne Capture-Backend zu testen.
 
@@ -180,6 +194,101 @@ physische Pixelauflösung des Panels — deutlich größer. `-max-height` (Defau
 empfohlen, um Bitrate und Latenz in einem vernünftigen Rahmen zu halten; die Skalierung passiert über
 `windowsScaleFilter` (`scale=-2:trunc(min(ih,maxHeight)/2)*2`, das Komma in `min(...)` muss im
 ffmpeg-Filtergraph escaped werden, siehe Kommentar dort).
+
+### Die vierte Falle: der GPU-Pfad ist auf Adreno versperrt (gemessen 2026-08-09)
+
+Der `hwdownload`-Roundtrip in der Filterkette sieht nach der offensichtlichsten Optimierung aus — `ddagrab`
+liefert D3D11-Frames, `h264_mf` bewirbt `d3d11` als akzeptiertes Pixelformat, und der lokale ffmpeg-Build
+enthält `scale_d3d11`. Die volle Panel-Surface (**2944×1840** BGRA ≈ 21,6 MB/Frame) pro Frame zur CPU und
+zurück zu schaufeln wäre damit vermeidbar. **Ist es auf dieser Hardware aber nicht.** Alle Varianten wurden
+direkt gegen `bin/ffmpeg.exe` (Build `N-125994`) geprüft:
+
+| Versuch | Ergebnis |
+|---|---|
+| `ddagrab,scale_d3d11=width=…:height=…:format=nv12` | `Could not create the texture (80070057)` = `E_INVALIDARG` |
+| `scale_d3d11=format=nv12` (nur Formatwandlung, kein Resize) | dito |
+| `scale_d3d11=width=…:height=…:format=bgra` (nur Resize, CPU-nv12 danach) | dito |
+| `scale_d3d11` ohne `format` | `Unsupported pixel format: (null)` — `format` ist Pflicht |
+| `ddagrab` → `h264_mf` direkt (D3D11-BGRA, kein `hwdownload`) | `failed processing input: 80004005` |
+| `scale_d3d12=w=…:h=…` | Optionen heißen anders; Format-Negotiation mit `ddagrab` scheitert generell |
+
+Der Adreno-D3D11-Treiber kann die Output-Textur, die `scale_d3d11` anfordert, schlicht nicht anlegen (sehr
+wahrscheinlich `D3D11_BIND_RENDER_TARGET` auf NV12). **Der CPU-Roundtrip ist damit unvermeidbar** — nicht
+erneut versuchen, ohne dass sich Treiber oder ffmpeg-Build geändert haben. Praktisch ist das verkraftbar:
+die CPU-Last liegt bei ~3,3 % von 12 Kernen, das System ist nicht CPU-bound.
+
+Ebenfalls gemessen und **akzeptiert** von diesem Build (für Latenz-Tuning relevant): `-flush_packets 1`,
+`-rate_control cbr -scenario live_streaming`, `-g 300`.
+
+### Latenz: was optimiert wurde und was man nicht zurückbauen darf
+
+Vier Eingriffe, alle in `internal/airplay`. Wer hier etwas „vereinfacht", macht wahrscheinlich eine davon
+rückgängig — deshalb hier die Begründungen.
+
+1. **Idle-Flush im NAL-Parser (`mirror.go`, `h264Parser.FlushTail` + `StreamFrames`).** Vorher wurde jeder
+   Frame ein volles Frame-Intervall zurückgehalten (~33 ms bei 30 fps): `pushAnnexB` kann einen NAL erst
+   abgrenzen, wenn der **nächste** Startcode da ist, und `flushVCL` wurde erst vom ersten NAL der nächsten
+   Access Unit ausgelöst. Frame N ging also erst raus, wenn Bytes von Frame N+1 eintrafen. Jetzt liest eine
+   eigene Goroutine, und bei stillem Input wird der zurückgehaltene NAL freigegeben.
+   **Der Truncation-Schutz ist nicht optional:** Ein abgeschnittener NAL ist nicht als kaputt erkennbar, er
+   dekodiert beim Receiver zu Müll. Freigegeben wird deshalb nur, wenn der Puffer über **zwei
+   aufeinanderfolgende stille Ticks byte-identisch** geblieben ist — ein Puffer, der nicht mehr wächst, kann
+   kein laufender Schreibvorgang sein. `idleFlushInterval = 4 ms`; bis zur Freigabe vergehen ein
+   Reset-Tick plus zwei Bestätigungs-Ticks, gemessen also ~8–12 ms statt ~33 ms.
+
+   **Die Metrik dazu ist `AUHoldMs`, und ihr Startpunkt ist mit Absicht die Ankunft der Daten aus ffmpeg,
+   nicht der Zeitpunkt, an dem die erste Slice in `vclBuf` landet.** Genau diese Wartezeit wird ja
+   eliminiert; ein Stempel hinter dem Warten würde vor *und* nach dem Fix ~0 ms melden und den größten
+   Gewinn wie einen Nulleffekt aussehen lassen. `TestStreamFramesSendsFrameWithoutNextFrameArriving`
+   verankert das mit einer Assertion — wer den Stempel verschiebt, bekommt einen roten Test.
+   Die Reader-Goroutine terminiert, wenn die Capture geschlossen wird (Daemon: `RemoveSink` →
+   `CloseWithError`; direkter Pfad: ffmpeg-Pipe). Tests dazu in `mirror_parser_test.go`, inklusive
+   Goroutine-Leak-Prüfung — die gehört zum Teardown-Pfad, dem heikelsten Pfad des Projekts.
+2. **`-flush_packets 1` (`capture_windows.go`).** Der Raw-h264-Muxer schreibt sonst durch einen 32-KB-
+   AVIO-Puffer; ein kleiner P-Frame kann darin liegenbleiben, bis der nächste Frame ihn herausdrückt.
+   Wirkt direkt mit Punkt 1 zusammen: ohne AU-atomare Pipe-Writes misst der Idle-Detektor den Flush-Rhythmus
+   des Muxers statt den des Encoders.
+3. **GOP-Default von 1 s auf 4 s (`-gop-seconds`).** Keyframes im Sekundentakt sind über TCP mit 64 KB
+   `SO_SNDBUF` periodische Sendespitzen. AirPlay läuft verlustfrei über TCP, häufige IDRs sind nach dem
+   ersten Keyframe nicht nötig.
+4. **Audio-Puffer 300 ms → 120 ms konfigurierbar, mit inkrementellem Drain (`audio_windows.go`).** Vorher
+   war der Deckel 300 ms und `appendPCM` verwarf bei Überlauf die ältesten Bytes **ohne jede Drift-Regelung**
+   — der Puffer parkte dauerhaft am Anschlag, 300 ms waren damit der Latenz-*Boden*, nicht der Worst Case.
+   Jetzt: Ziel = `-audio-buffer-ms`, Drain ab 150 % des Ziels, Notfall-Hard-Cap bei 200 %.
+   **Der Drain muss inkrementell bleiben** (1–2 ALAC-Frames ≈ 8–16 ms pro Schritt): den ganzen Überhang auf
+   einmal zu verwerfen sind ~180 ms Samples und das knackt hörbar.
+
+**Bewusst NICHT geändert:** Der `fps=<fps>`-Filter bleibt in der Filterkette. Ein Leerlauftest zeigt keine
+dts-Fehler ohne ihn, aber dieser Test kann den Fehlerfall strukturell gar nicht reproduzieren — er ist
+last- und updateabhängig. Eine messtechnisch erkämpfte Schutzmaßnahme wird nicht auf Basis eines Tests
+entfernt, der nicht fehlschlagen kann.
+
+**Ebenfalls bewusst nur gemessen, nicht korrigiert:** `mediaClock.reanchor` (`mirror.go`) setzt
+`anchorLocal = receivedAt` und behandelt den Receiver-Timestamp damit als verzögerungsfrei — der Clock-Anchor
+trägt dadurch einen systematischen Offset von etwa RTT/2. Der RTT wird jetzt gemessen und angezeigt, die
+Anchor-Korrektur wäre aber ein separater, riskanter Eingriff in Upstream-Protokollcode.
+
+### Statistik-Subsystem (`internal/airplay/stats.go`)
+
+`SessionStats` sammelt pro Session; `MirrorSession.Stats()` liefert einen `StatsSnapshot`. Zwei
+Design-Entscheidungen, die man kennen sollte:
+
+- **Alle Methoden vertragen einen nil-Receiver.** Die Aufrufstellen liegen im Hot Path (pro Frame) und
+  kommen deshalb ohne eigene nil-Prüfung aus; Tests, die `&MirrorSession{...}` als Literal bauen, laufen
+  unverändert weiter.
+- **Raten werden in 500-ms-Zeitslots akkumuliert, nicht von einem Ticker gesampelt.** Dadurch liefern eine
+  1-Hz-pollende GUI, ein einmaliges `doubletake-ctl stats` und eine unbeobachtete Session dieselben Zahlen,
+  und es gibt keine zusätzliche Goroutine, die beim Teardown abgeräumt werden müsste. 500 ms statt 1 s, weil
+  Sekundenmittel genau die Keyframe-Spitzen wegglätten, die man sehen will.
+
+`StatsSnapshot` hat json-Tags und ist **direkt der Wire-Vertrag** bis in die GUI: der Daemon hängt ihn als
+`Response.Stats` (`stats,omitempty`) an die `status`-Antwort, ohne Mapping-Schicht. Ein Feld hier umzubenennen
+ändert also den GUI-Vertrag mit. Kein eigenes `stats`-Kommando — der Control-Channel ist one-shot pro
+TCP-Verbindung, und die GUI öffnet ohnehin schon Verbindungen pro Poll-Tick.
+
+**Nullwerte im `history`-Array sind echte Messwerte, keine Lücken.** Zeitslots vor dem Sessionstart lässt der
+Daemon komplett weg (frühe Sessions liefern ein *kürzeres* Array), eine Null bedeutet also immer: in diesen
+500 ms wurde kein Frame gesendet — ein Stall. Die GUI muss sie als Null zeichnen, nicht überspringen.
 
 ### Zwei plattformspezifische Stolpersteine
 
@@ -255,10 +364,31 @@ Electron-GUI (gui/)                    Go-Daemon/CLI (cmd/, internal/)
     Renderer), Settings-Persistenz (`userData/settings.json`), IPC-Handler.
   - `preload.js` — Context-Bridge zwischen Main und Renderer (contextIsolation aktiv, kein
     `nodeIntegration`).
-  - `renderer/` — UI (HTML/CSS/JS ohne Build-Step), `pcm-worklet.js` — AudioWorklet, das
-    WASAPI-Loopback-Samples (über `getDisplayMedia({ audio: 'loopback' })`) in PCM-Chunks an den Main-
-    Prozess weiterreicht.
-  - `tools/fake-daemon.js`, `tools/pcm-sink.js` — Testwerkzeuge, s. Abschnitt 2.
+  - `renderer/` — UI (HTML/CSS/JS ohne Build-Step), drei Tabs (Verbinden / Statistik / Einstellungen);
+    `pcm-worklet.js` — AudioWorklet, das WASAPI-Loopback-Samples (über
+    `getDisplayMedia({ audio: 'loopback' })`) in PCM-Chunks an den Main-Prozess weiterreicht.
+  - `tools/fake-daemon.js`, `tools/pcm-sink.js`, `tools/ui-check.js` — Testwerkzeuge, s. Abschnitt 2.
+
+#### GUI-Besonderheiten, die man beim Erweitern kennen muss
+
+- **Strikte CSP** (`renderer/index.html`): `default-src 'self'`, keine Inline-Styles/-Scripts, keine
+  externen Assets. Deshalb sind die Sparklines handgezeichnete `<canvas>`-Kurven und keine Chart-Bibliothek.
+- **Settings sind Whitelist-basiert** (`main.js:sanitizeSettings`): ein neuer Key, der dort nicht ergänzt
+  wird, geht beim Speichern **stillschweigend verloren**. `daemonFlagsChanged` entscheidet separat, ob eine
+  Änderung einen Daemon-Neustart auslöst — reine UI-Einstellungen (`preset`, `expertMode`, `trayIcon`,
+  `autoConnect`, `activeTab`, `lastDevice`, …) dürfen das nicht.
+- **Tray-Icon ändert die Bedeutung von „Fenster schließen"** von *beenden* zu *verstecken*. Es gibt bewusst
+  genau **einen** Ausstiegspunkt: `app.on('before-quit')` → `cleanShutdown()` → `stopSidecarClean()` →
+  `disconnect`/TEARDOWN → `app.exit(0)`. Tray-„Beenden" ruft nur `app.quit()`, nie `app.exit()` oder
+  `destroy()`, und `window-all-closed` beendet bei aktivem Tray nicht. Wer hier einen zweiten Pfad einbaut,
+  killt Sessions ohne TEARDOWN — siehe „Die wichtigste Betriebsregel".
+- **Der Audio-Toggle hat bewusst einen eigenen Change-Listener** statt in der generischen Liste zu stehen:
+  `getDisplayMedia()` braucht eine aktive Nutzergeste, die durch ein vorgeschaltetes `await` verloren ginge.
+- **Der Zähler verworfener Audio-Chunks reitet auf `mirror:status` mit**, nicht auf `audio:status` — letzterer
+  pusht nur bei Zustands*wechseln* und würde nach dem ersten Connect einfrieren.
+- **`ALLOWED_EVENTS` in `preload.js`** muss für jeden neuen Push-Kanal erweitert werden, sonst wirft `on()`.
+- **Statuspolling**: `status` alle 1 s während des Streamings (sonst 2 s), `devices` entkoppelt alle 2 s, mit
+  In-Flight-Guard gegen sich stapelnde Ticks.
 - **`tools/pcmtest/`** — Go-Testwerkzeug für den Audio-TCP-Kanal, s. Abschnitt 2.
 - **`man/`, `plasmoid/`** — Upstream-Linux-Artefakte (Manpages, KDE-Plasma-Widget), im Fork unverändert und
   für den Windows-Pfad nicht relevant.
@@ -306,6 +436,19 @@ Fenster-Schließen bei aktivem Stream, Audio.
   NSIS) wurde noch nicht vollständig verifiziert.
 - **Praktische Bedienabnahme der GUI durch den Nutzer steht aus** (über die Low-Level-Verifikation von
   Pairing/Mirroring/Audio hinaus).
+- **Die Latenz-Optimierungen sind noch nicht gegen echte Hardware gemessen.** Idle-Flush, `-flush_packets`,
+  GOP-Default 4 s und der Audio-Drain sind implementiert und durch Unit-Tests abgesichert, aber der A/B-
+  Vergleich gegen das Apple TV steht aus (Gerät war beim Bau nicht erreichbar). Vorgehen: Baseline mit
+  `doubletake-ctl stats` aufnehmen (`au hold` erwartet ~33 ms vor, ~8–12 ms nach dem Idle-Flush), dann die
+  Änderungen einzeln umschalten. Die echte Ende-zu-Ende-Latenz braucht zusätzlich eine Handmessung
+  (Millisekunden-Stoppuhr im Vollbild, Foto von Laptop und TV nebeneinander) — die Instrumentierung misst
+  nur bis zum Socket bzw. das, was der Receiver über sich selbst meldet.
+- **Ob `-target-latency-ms` überhaupt wirkt, ist ungeprüft.** Der `Audio-Latency`-Header der RECORD-Antwort
+  überschreibt den Wert (`mirror.go`). Ein `-debug`-Lauf gegen das echte Gerät klärt, ob der Regler in der
+  GUI echt oder kosmetisch ist; die Statistik zeigt unter `target_latency_ms` den tatsächlich wirksamen Wert.
+- **`-race` ist auf windows/arm64 nicht verfügbar.** Die Nebenläufigkeit im neuen Statistik-Subsystem und im
+  Reader-Goroutine-Umbau ist dadurch lokal nicht mit dem Race-Detector geprüft — ein Linux-CI-Lauf wäre der
+  natürliche Ort dafür (siehe auch den fehlenden Windows-CI-Punkt unten).
 - **Upstream hat offene Bugs**, u. a. schlechtere Latenz als bei echten Apple-Sendegeräten. Ein
   Windows-Backend wäre ein natürlicher Beitrag zurück an `omarroth/doubletake`; die
   Capture-/Audio-Aufteilung per Build-Tag ist genau als Byte-Grenze dafür gebaut (`ScreenCapture`/

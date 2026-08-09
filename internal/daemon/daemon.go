@@ -55,6 +55,13 @@ type Response struct {
 	Error      string       `json:"error,omitempty"`
 	Devices    []DeviceInfo `json:"devices,omitempty"`
 	Streams    []StreamInfo `json:"streams,omitempty"`
+
+	// Stats carries the streaming stream's connection-quality statistics.
+	// StatsSnapshot's json tags are already the wire contract shared with the
+	// GUI (see airplay/stats.go), so it is embedded directly rather than
+	// mapped into a daemon-local type. Nil (omitted) when no stream is
+	// currently streaming.
+	Stats *airplay.StatsSnapshot `json:"stats,omitempty"`
 }
 
 // DeviceInfo is a simplified view of a discovered AirPlay device.
@@ -93,6 +100,20 @@ type Config struct {
 	// for raw PCM audio on Windows (see audio_windows.go); ignored on Linux.
 	// Zero (the Config zero value) means airplay.DefaultAudioTCPPort.
 	AudioTCPPort int
+
+	// AudioBufferMs is the target PCM backlog in milliseconds for the Windows
+	// TCP audio source. Zero means the platform default. Dominant contributor
+	// to audio latency; see airplay.StartAudioCapture.
+	AudioBufferMs int
+
+	// GOPSeconds is the keyframe interval in seconds, forwarded to
+	// airplay.CaptureConfig. Zero selects the encoder's default.
+	GOPSeconds int
+
+	// RateControl selects the capture encoder's rate-control strategy,
+	// forwarded to airplay.CaptureConfig: "" / "display_remoting" (default)
+	// or "cbr_live". See airplay.ValidateRateControl.
+	RateControl string
 }
 
 // DefaultControlAddr returns the default control channel address: a Unix
@@ -201,6 +222,9 @@ func New(cfg Config) (*Daemon, error) {
 	}
 	if cfg.HWAccel == "" {
 		cfg.HWAccel = "auto"
+	}
+	if err := airplay.ValidateRateControl(cfg.RateControl); err != nil {
+		return nil, fmt.Errorf("rate control: %w", err)
 	}
 	var cs *airplay.CredentialStore
 	switch cfg.CredBackend {
@@ -735,16 +759,24 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 
 	overall := d.overallStateLocked()
 
-	// Populate legacy single-stream fields using the first streaming entry for
-	// backwards-compatibility with existing clients.
+	// Populate legacy single-stream fields, and the stats snapshot, using the
+	// first streaming entry for backwards-compatibility with existing
+	// clients. Stats come from the same stream so the two stay consistent
+	// (a client comparing device_ip against the stats it's looking at should
+	// never see one stream's name paired with another's numbers).
 	var device, deviceIP string
 	var hasAudio, audioMuted bool
+	var stats *airplay.StatsSnapshot
 	for _, s := range streams {
 		if s.State == StateStreaming {
 			device = s.Device
 			deviceIP = s.DeviceIP
 			hasAudio = s.HasAudio
 			audioMuted = s.AudioMuted
+			if entry, ok := d.streams[s.DeviceIP]; ok && entry.session != nil {
+				snap := entry.session.Stats()
+				stats = &snap
+			}
 			break
 		}
 	}
@@ -759,6 +791,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 		NeedsPIN:   overall == StatePINRequired,
 		Error:      errMsg,
 		Streams:    streams,
+		Stats:      stats,
 	}
 }
 
@@ -1154,13 +1187,27 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 
 	log.Printf("[daemon] streaming to %s (%s)", info.Name, target)
 
+	// Report the encoder parameters actually in effect, so the GUI/CLI show
+	// what is running rather than what was requested. SetEncoder touches only
+	// these two fields on purpose: the negotiated target latency was already
+	// recorded during session setup (and may differ from the configured
+	// airplay.TargetLatency() once the receiver's Audio-Latency header or its
+	// playout floor apply), and the resolution comes from the SPS later.
+	if capture := d.sharedCapture(); capture != nil {
+		session.StatsCollector().SetEncoder(capture.EncoderName(), capture.RateControlName())
+	}
+
 	// Start audio for this stream independently.
 	if !d.cfg.NoAudio && session.HasAudio() {
-		audioCapture, audioErr := airplay.StartAudioCapture(ctx, d.cfg.TestMode, d.cfg.AudioTCPPort)
+		audioCapture, audioErr := airplay.StartAudioCapture(ctx, d.cfg.TestMode, d.cfg.AudioTCPPort, d.cfg.AudioBufferMs)
 		if audioErr != nil {
 			log.Printf("[daemon] audio capture failed: %v (continuing without audio)", audioErr)
 		} else {
 			defer audioCapture.Stop()
+			// SetStats is being added to AudioCapture by a parallel change;
+			// wires the audio pipeline's buffer/underrun/drain counters into
+			// this session's stats collector once both exist.
+			audioCapture.SetStats(session.StatsCollector())
 			go func() {
 				if aerr := session.StreamAudio(ctx, audioCapture, session.AudioStream()); aerr != nil && ctx.Err() == nil {
 					log.Printf("[daemon] audio streaming error: %v", aerr)
@@ -1199,6 +1246,15 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	log.Printf("[daemon] stream ended for %s", target)
 }
 
+// sharedCapture returns the currently running shared screen capture, or nil
+// if none is active. Safe to call with or without d.mu held (it takes the
+// lock itself).
+func (d *Daemon) sharedCapture() *airplay.ScreenCapture {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.capture
+}
+
 // getOrStartBroadcastLocked ensures a shared BroadcastCapture is running and
 // returns a new sink registered with it. If no capture is running, it starts one.
 // Must NOT be called with d.mu held.
@@ -1222,6 +1278,8 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airp
 		RestoreToken: restoreToken,
 		OutputIndex:  d.cfg.OutputIndex,
 		MaxHeight:    d.cfg.MaxHeight,
+		GOPSeconds:   d.cfg.GOPSeconds,
+		RateControl:  d.cfg.RateControl,
 	}
 	if deviceID != "" {
 		capCfg.SaveRestoreToken = func(token string) error {

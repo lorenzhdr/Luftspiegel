@@ -13,11 +13,13 @@ import (
 // (the default sink's PulseAudio monitor, or PipeWire) and feeds raw PCM into
 // the built-in ALAC encoder via AudioCapture.ReadFrame.
 //
-// tcpPort is part of the shared cross-platform signature (see
-// audio_windows.go, which uses it to pick the local TCP listener port) and is
-// unused on Linux, which has no TCP audio source.
-func StartAudioCapture(ctx context.Context, testTone bool, tcpPort int) (*AudioCapture, error) {
+// tcpPort and bufferMs are part of the shared cross-platform signature (see
+// audio_windows.go, which uses them to pick the local TCP listener port and to
+// bound its PCM backlog) and are unused on Linux, which has no TCP audio
+// source and lets GStreamer own the buffering.
+func StartAudioCapture(ctx context.Context, testTone bool, tcpPort, bufferMs int) (*AudioCapture, error) {
 	_ = tcpPort
+	_ = bufferMs
 
 	captureCtx, cancel := context.WithCancel(ctx)
 

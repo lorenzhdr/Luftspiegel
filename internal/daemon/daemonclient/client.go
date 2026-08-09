@@ -31,6 +31,16 @@ func (c *Client) Status() (*daemon.Response, error) {
 	return c.send(daemon.Request{Cmd: "status"})
 }
 
+// Stats returns the daemon's current state, including the streaming stream's
+// connection-quality statistics (Response.Stats). There is no separate
+// "stats" command on the wire: the control channel is one-shot per
+// connection (see daemon.handleConn), and status already carries the stats
+// snapshot alongside the rest of the state, so this is just Status under a
+// name that matches what the caller is after.
+func (c *Client) Stats() (*daemon.Response, error) {
+	return c.send(daemon.Request{Cmd: "status"})
+}
+
 // Discover triggers device discovery and returns found devices.
 func (c *Client) Discover() (*daemon.Response, error) {
 	return c.send(daemon.Request{Cmd: "discover"})

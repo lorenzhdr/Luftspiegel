@@ -115,6 +115,27 @@ type AudioCapture struct {
 	extraStop func()
 }
 
+// SetStats attaches the session's statistics collector to the capture, so
+// backlog/underrun/drain events on the platform-specific PCM source become
+// visible in StatsSnapshot (see stats.go's Audio* fields). Called from
+// outside once StartAudioCapture has returned — in the daemon, after the
+// mirroring session (and its SessionStats) exist but while capture is
+// already running acceptLoop/readLoop in the background, so this cannot
+// assume it runs before those goroutines start touching the source.
+//
+// AudioCapture itself has no use for the pointer — only the backend that
+// actually tracks buffer occupancy does (tcpPCMSource on Windows) — so this
+// just forwards to pcmPipe if it opts in via the unexported optional
+// interface below, keeping the concurrency handling (see
+// tcpPCMSource.stats) local to the implementation that needs it. Backends
+// that don't track a backlog (the Linux GStreamer pipe, the sine test tone)
+// don't implement it, and this is a silent no-op for them.
+func (ac *AudioCapture) SetStats(s *SessionStats) {
+	if setter, ok := ac.pcmPipe.(interface{ SetStats(*SessionStats) }); ok {
+		setter.SetStats(s)
+	}
+}
+
 // ReadFrame reads a single ALAC-encoded audio frame.
 func (ac *AudioCapture) ReadFrame(buf []byte) (int, error) {
 	select {
@@ -789,6 +810,11 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 			retransmitBuf[retransmitIdx] = audioFrame{payload: payload, rtpTime: nextRtp, seq: frameSeq, nonce: nonce}
 			retransmitIdx = (retransmitIdx + 1) % retransmitDepth
 		}
+		// Recorded only once every branch above has confirmed its send(s)
+		// succeeded (each returns early on error before reaching here) — the
+		// same "count what was actually sent" convention StreamFrames uses
+		// for s.stats.RecordFrame on the video side.
+		s.stats.RecordAudioFrame()
 
 		frameSeq++
 		nextRtp += spf
