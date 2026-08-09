@@ -365,3 +365,103 @@ func TestStreamFramesFlushesTailOnEOF(t *testing.T) {
 		t.Fatal("StreamFrames did not return after EOF")
 	}
 }
+
+// findStartCode's loop bound used to require 3 bytes to remain *after* the
+// candidate index (i+3 < len(b)), which is one byte too many for a 3-byte
+// start code (00 00 01) — that only needs i+2 < len(b) to confirm. A buffer
+// ending flush on a 3-byte start code therefore looked like no start code at
+// all. That fed straight into flushTail's truncation guard
+// (findStartCode(p.buf, 3) >= 0, mirror.go ~line 1236): a buffer holding one
+// NAL plus a dangling 3-byte start code would look like exactly one NAL and
+// get released whole, corrupting the stream.
+func TestFindStartCodeFindsThreeByteCodeAtBufferEnd(t *testing.T) {
+	tests := []struct {
+		name string
+		buf  []byte
+		from int
+		want int
+	}{
+		{
+			name: "three-byte code flush with buffer end",
+			buf:  []byte{0x41, 0x42, 0x00, 0x00, 0x01},
+			from: 0,
+			want: 2,
+		},
+		{
+			name: "three-byte code is the entire buffer",
+			buf:  []byte{0x00, 0x00, 0x01},
+			from: 0,
+			want: 0,
+		},
+		{
+			name: "four-byte code at buffer end",
+			buf:  []byte{0x41, 0x00, 0x00, 0x00, 0x01},
+			from: 0,
+			want: 1,
+		},
+		{
+			name: "no start code",
+			buf:  []byte{0x41, 0x42, 0x43, 0x44, 0x45},
+			from: 0,
+			want: -1,
+		},
+		{
+			name: "start code at the very beginning",
+			buf:  []byte{0x00, 0x00, 0x01, 0x41, 0x42},
+			from: 0,
+			want: 0,
+		},
+		{
+			name: "buffer shorter than any start code",
+			buf:  []byte{0x00, 0x00},
+			from: 0,
+			want: -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := findStartCode(tt.buf, tt.from); got != tt.want {
+				t.Errorf("findStartCode(% x, from=%d) = %d, want %d", tt.buf, tt.from, got, tt.want)
+			}
+		})
+	}
+}
+
+// buildAVCCConfig used to index sps[1], sps[2], sps[3] unconditionally. A
+// truncated SPS — which a misdelimited NAL (see the findStartCode bug above)
+// or a genuinely corrupt capture stream can produce — panicked the streaming
+// goroutine and took the whole daemon process down with it.
+func TestBuildAVCCConfigRejectsShortSPS(t *testing.T) {
+	for n := 0; n < 4; n++ {
+		sps := make([]byte, n)
+		if got := buildAVCCConfig(sps, nil); got != nil {
+			t.Errorf("buildAVCCConfig with %d-byte sps and nil pps = %v, want nil", n, got)
+		}
+	}
+
+	// A valid-length SPS with an empty PPS must also be rejected, not just a
+	// short SPS.
+	validSPS := []byte{0x67, 0x64, 0x00, 0x1f, 0x11, 0x22}
+	if got := buildAVCCConfig(validSPS, nil); got != nil {
+		t.Errorf("buildAVCCConfig with valid sps but nil pps = %v, want nil", got)
+	}
+}
+
+// The guard added for the panic above must not reject legitimate input.
+func TestBuildAVCCConfigAcceptsValidSPSAndPPS(t *testing.T) {
+	sps := []byte{0x67, 0x64, 0x00, 0x1f, 0x11, 0x22}
+	pps := []byte{0x68, 0xce}
+
+	got := buildAVCCConfig(sps, pps)
+	if got == nil {
+		t.Fatal("buildAVCCConfig returned nil for valid sps/pps")
+	}
+	if got[0] != 0x01 {
+		t.Errorf("payload[0] = %#02x, want 0x01 (configurationVersion)", got[0])
+	}
+	wantLen := 6 + 2 + len(sps) + 1 + 2 + len(pps) + 4 // +4 for the iPhone-capture trailer
+	if len(got) != wantLen {
+		t.Errorf("len(payload) = %d, want %d", len(got), wantLen)
+	}
+}

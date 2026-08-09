@@ -142,6 +142,13 @@ type activeStream struct {
 	sink       *airplay.BroadcastSink // fan-out video sink (nil when no broadcast)
 	cancelFn   context.CancelFunc
 	pinCh      chan string
+
+	// audioSuppressed marks a stream that is deliberately running without
+	// audio because another stream already owns the single audio source
+	// (see Daemon.audioOwner). It exists so status reporting can tell the
+	// truth: session.HasAudio() only says the receiver negotiated audio
+	// ports, not that anything is actually being sent to them.
+	audioSuppressed bool
 }
 
 // Daemon manages a long-running doubletake service.
@@ -186,6 +193,45 @@ type Daemon struct {
 
 	// PIN-waiting state (at most one device waits for a PIN at a time)
 	pendingTarget string
+
+	// audioOwner is the target IP of the stream that currently owns the
+	// single system-audio source, or "" if none does.
+	//
+	// StartAudioCapture binds one fixed local TCP port on Windows
+	// (DefaultAudioTCPPort) for the GUI to push PCM into, so exactly one
+	// stream can have audio at a time. Previously every stream just called
+	// StartAudioCapture and the second one got EADDRINUSE, which was logged
+	// and otherwise ignored — while status still advertised has_audio:true
+	// for it, because that was derived from the receiver's SETUP
+	// negotiation. Tracking the owner explicitly turns a silent lie into an
+	// accurate "video only" report (see audioSuppressed and streamHasAudio).
+	audioOwner string
+
+	// teardownWG tracks every in-flight asynchronous stream teardown.
+	// Shutdown waits on it AFTER releasing d.mu.
+	//
+	// Session teardown blocks: MirrorSession.Close() waits for its worker
+	// goroutines (a feedback loop can be parked in an RTSP request with a
+	// 30s read deadline) and then sends a synchronous RTSP TEARDOWN. Doing
+	// that under d.mu froze the whole control channel for 60-120s whenever a
+	// receiver dropped off the network, so every status poll from the GUI
+	// ran into its own timeout and the app looked hung. The rule now is:
+	// only non-blocking state changes happen under d.mu; anything that waits
+	// on the network or on a process runs in a teardown goroutine.
+	teardownWG sync.WaitGroup
+
+	// teardownFn performs the blocking part of a stream teardown. Nil means
+	// defaultTeardown; it exists as a seam for tests.
+	//
+	// Deliberately NOT set in New(): some tests construct &Daemon{...}
+	// literals directly and never go through New(), so the nil fallback has
+	// to live at the call site (see teardownLocked).
+	//
+	// The callback must never touch d.mu — that is what guarantees
+	// Shutdown's teardownWG.Wait() cannot deadlock against a teardown that
+	// is trying to take the lock.
+	teardownFn func(sink *airplay.BroadcastSink, session *airplay.MirrorSession,
+		client *airplay.AirPlayClient, capture *airplay.ScreenCapture)
 
 	discoverCancel context.CancelFunc
 	listener       net.Listener
@@ -266,13 +312,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	d.listener = ln
 
 	log.Printf("[daemon] listening on %s", ln.Addr().String())
 
 	// Start continuous mDNS discovery in the background
 	discoverCtx, discoverCancel := context.WithCancel(ctx)
+
+	// Both fields are read by Shutdown under d.mu, and Shutdown runs on a
+	// genuinely concurrent signal goroutine (see cmd/doubletake/main.go), so
+	// they must be published under the same lock. Unsynchronised, Shutdown
+	// could see a nil discoverCancel (discovery keeps running) or a nil
+	// listener (the socket is never closed).
+	d.mu.Lock()
+	d.listener = ln
 	d.discoverCancel = discoverCancel
+	d.mu.Unlock()
+
 	go d.backgroundDiscover(discoverCtx)
 
 	go func() {
@@ -294,9 +349,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 }
 
 // Shutdown stops any active sessions and cleans up the socket.
+//
+// It waits for the RTSP TEARDOWNs it started (bounded by
+// shutdownTeardownWait) before returning: AirPlay receivers keep a session
+// pinned and refuse the next connection if they never see one.
 func (d *Daemon) Shutdown() {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.discoverCancel != nil {
 		d.discoverCancel()
 		d.discoverCancel = nil
@@ -305,7 +363,33 @@ func (d *Daemon) Shutdown() {
 	if d.listener != nil {
 		d.listener.Close()
 	}
+	// The lock MUST be released before waiting: a teardown goroutine that
+	// tried to take d.mu would otherwise deadlock against us.
+	d.mu.Unlock()
+
+	// Wait on the WaitGroup rather than just the channels stopAllLocked
+	// returned, so a teardown left running by an earlier "disconnect" that
+	// hit disconnectTeardownWait also gets to finish its TEARDOWN.
+	if !waitWaitGroup(&d.teardownWG, shutdownTeardownWait) {
+		log.Printf("[daemon] gave up waiting for stream teardowns after %v; some receivers may not have received a TEARDOWN", shutdownTeardownWait)
+	}
 	cleanupControlAddr(d.cfg.SocketPath)
+}
+
+// waitWaitGroup waits for wg, but no longer than limit. Returns true if wg
+// finished in time.
+func waitWaitGroup(wg *sync.WaitGroup, limit time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(limit):
+		return false
+	}
 }
 
 const (
@@ -731,8 +815,11 @@ func (d *Daemon) overallStateLocked() State {
 // daemon from starting the local audio capture pipeline. So with -no-audio
 // set, no audio is ever actually flowing, and has_audio must report false
 // even though session.HasAudio() (a negotiation-level fact) is true.
+// audioSuppressed additionally covers the case where another stream already
+// owns the single audio source (see Daemon.audioOwner): the receiver
+// negotiated audio ports, but this daemon is not feeding them.
 func (d *Daemon) streamHasAudio(s *activeStream) bool {
-	return !d.cfg.NoAudio && s.session != nil && s.session.HasAudio()
+	return !d.cfg.NoAudio && !s.audioSuppressed && s.session != nil && s.session.HasAudio()
 }
 
 func (d *Daemon) handleStatus() Response {
@@ -1197,11 +1284,36 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		session.StatsCollector().SetEncoder(capture.EncoderName(), capture.RateControlName())
 	}
 
-	// Start audio for this stream independently.
+	// Start audio for this stream — but only one stream at a time can have
+	// it. StartAudioCapture binds a single fixed local TCP port on Windows,
+	// so a second concurrent stream would just collect EADDRINUSE. Claim the
+	// slot explicitly instead, and mark the stream so status reporting stays
+	// honest rather than advertising audio that isn't flowing.
+	audioWanted := false
 	if !d.cfg.NoAudio && session.HasAudio() {
+		d.mu.Lock()
+		if d.audioOwner == "" {
+			d.audioOwner = target
+			audioWanted = true
+		} else {
+			entry.audioSuppressed = true
+			log.Printf("[daemon] audio already bound to %s; %s streams video only (multi-stream audio not yet supported)", d.audioOwner, target)
+		}
+		d.mu.Unlock()
+	}
+
+	if audioWanted {
 		audioCapture, audioErr := airplay.StartAudioCapture(ctx, d.cfg.TestMode, d.cfg.AudioTCPPort, d.cfg.AudioBufferMs)
 		if audioErr != nil {
 			log.Printf("[daemon] audio capture failed: %v (continuing without audio)", audioErr)
+			// Release the slot again and report honestly, otherwise a failed
+			// start would block audio for every later stream.
+			d.mu.Lock()
+			if d.audioOwner == target {
+				d.audioOwner = ""
+			}
+			entry.audioSuppressed = true
+			d.mu.Unlock()
 		} else {
 			defer audioCapture.Stop()
 			// SetStats is being added to AudioCapture by a parallel change;
@@ -1338,62 +1450,161 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airp
 				log.Printf("[daemon] broadcast capture ended (stopped): %v", runErr)
 			}
 		}
-		// When the capture ends, stop all active streams.
+		// When the capture ends, stop all active streams. Waiting happens
+		// outside d.mu — holding it across the teardowns would freeze the
+		// control channel exactly when ffmpeg has just died, which is the
+		// moment the user is most likely to be clicking around in the GUI.
 		d.mu.Lock()
-		d.stopAllLocked()
+		dones := d.stopAllLocked()
 		d.mu.Unlock()
+		waitTeardowns(dones, shutdownTeardownWait)
 	}()
 
 	return sink, nil
 }
 
-// removeStreamLocked removes a single stream entry and tears down the shared
+// removeStreamLocked removes a single stream entry and detaches the shared
 // capture if no other streams are left. Must be called with d.mu held.
-func (d *Daemon) removeStreamLocked(target string) {
+//
+// Returns the detached *ScreenCapture, if any. The caller MUST stop it
+// outside d.mu (see maybeStopBroadcastLocked).
+func (d *Daemon) removeStreamLocked(target string) *airplay.ScreenCapture {
 	entry, ok := d.streams[target]
 	if !ok {
-		return
+		return nil
 	}
 	if d.pendingTarget == target {
 		d.pendingTarget = ""
+	}
+	if d.audioOwner == target {
+		// Free the audio slot so a later connect can take it over. Existing
+		// streams deliberately do not get promoted — that would mean
+		// starting StreamAudio for a session mid-flight.
+		d.audioOwner = ""
 	}
 	if entry.cancelFn != nil {
 		entry.cancelFn()
 	}
 	delete(d.streams, target)
-	d.maybeStopBroadcastLocked()
+	return d.maybeStopBroadcastLocked()
 }
 
-// maybeStopBroadcastLocked stops the shared capture if no active streams remain.
+// maybeStopBroadcastLocked detaches the shared capture if no active streams
+// remain, and returns it so the caller can stop it OUTSIDE d.mu.
 // Must be called with d.mu held.
-func (d *Daemon) maybeStopBroadcastLocked() {
+//
+// ScreenCapture.Stop() blocks for up to 2s and, in the kill fallback, waits
+// on the process without a bound — running it under d.mu put that latency on
+// every teardown path, including the success path of connectAndStream.
+func (d *Daemon) maybeStopBroadcastLocked() *airplay.ScreenCapture {
 	if len(d.streams) > 0 {
-		return
+		return nil
 	}
 	// Mark this teardown as expected, and cancel the capture's context,
-	// before actually stopping it: see the captureStopExpected field doc for
-	// why both must happen in this order and while still holding d.mu.
+	// before handing it off: see the captureStopExpected field doc for why
+	// both must happen in this order and while still holding d.mu. Only the
+	// blocking Stop() moves out of the lock, so the mutual-exclusion
+	// argument documented there is unaffected — the Run() goroutine still
+	// reads the flag under the same mutex that set it.
 	d.captureStopExpected = true
 	if d.captureCancel != nil {
 		d.captureCancel()
 		d.captureCancel = nil
 	}
-	if d.capture != nil {
-		d.capture.Stop()
-		d.capture = nil
-	}
+	old := d.capture
+	d.capture = nil
 	d.broadcast = nil
+	return old
+}
+
+// defaultTeardown performs the blocking half of a stream teardown.
+//
+// The order is binding: closing the sink first releases StreamFrames from
+// its read, then session.Close() runs the RTSP TEARDOWN, and only then is
+// the client's TCP connection closed. Closing the client before the session
+// would kill the TEARDOWN — and a receiver that never sees a TEARDOWN keeps
+// the session pinned and refuses the next connection attempt.
+func defaultTeardown(sink *airplay.BroadcastSink, session *airplay.MirrorSession,
+	client *airplay.AirPlayClient, capture *airplay.ScreenCapture) {
+	if sink != nil {
+		sink.Close()
+	}
+	if session != nil {
+		session.Close()
+	}
+	if client != nil {
+		client.Close()
+	}
+	if capture != nil {
+		capture.Stop()
+	}
+}
+
+// teardownLocked starts the blocking teardown of one stream in its own
+// goroutine and returns a channel closed when it finishes.
+//
+// Must be called with d.mu held: the WaitGroup counter has to be incremented
+// under the same lock that removed the stream from d.streams, otherwise
+// Shutdown could snapshot the map, see nothing left, and return while this
+// teardown is still starting up.
+func (d *Daemon) teardownLocked(sink *airplay.BroadcastSink, session *airplay.MirrorSession,
+	client *airplay.AirPlayClient, capture *airplay.ScreenCapture) <-chan struct{} {
+
+	done := make(chan struct{})
+	fn := d.teardownFn
+	if fn == nil {
+		fn = defaultTeardown
+	}
+	d.teardownWG.Add(1)
+	go func() {
+		defer d.teardownWG.Done()
+		defer close(done)
+		fn(sink, session, client, capture)
+	}()
+	return done
+}
+
+// disconnectTeardownWait bounds how long a "disconnect" request waits for the
+// TEARDOWN it kicked off before answering anyway.
+//
+// Kept below the GUI's 3s control-channel timeout (DEFAULT_TIMEOUT_MS in
+// gui/main.js) with room for connection setup, so a slow teardown never turns
+// a successful disconnect into a red error banner. A healthy receiver
+// finishes in milliseconds; this only ever bites on a dead one.
+const disconnectTeardownWait = 1500 * time.Millisecond
+
+// shutdownTeardownWait bounds how long Shutdown waits for outstanding
+// teardowns before giving up and letting the process exit.
+const shutdownTeardownWait = 10 * time.Second
+
+// waitTeardowns waits for all of dones, but no longer than limit. Returns
+// true if everything finished in time.
+func waitTeardowns(dones []<-chan struct{}, limit time.Duration) bool {
+	if len(dones) == 0 {
+		return true
+	}
+	deadline := time.NewTimer(limit)
+	defer deadline.Stop()
+	for _, done := range dones {
+		select {
+		case <-done:
+		case <-deadline.C:
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Daemon) handleDisconnect(req Request) Response {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	// If a target is specified, disconnect only that stream.
 	if req.Target != "" {
 		entry, ok := d.streams[req.Target]
 		if !ok {
-			return Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
+			resp := Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
+			d.mu.Unlock()
+			return resp
 		}
 		// Cancel the streaming goroutine's context before tearing down its
 		// sink/session/client (mirrors stopAllLocked's order below). That
@@ -1401,21 +1612,30 @@ func (d *Daemon) handleDisconnect(req Request) Response {
 		// "read on closed pipe"/connection-closed errors this causes as
 		// the expected effect of an intentional disconnect rather than a
 		// real streaming failure worth logging.
-		d.removeStreamLocked(req.Target)
-		if entry.sink != nil {
-			entry.sink.Close()
+		sink, session, client := entry.sink, entry.session, entry.client
+		capture := d.removeStreamLocked(req.Target)
+		// Build the response while still holding the lock: the stream is
+		// already out of d.streams, so a concurrent status poll sees it gone
+		// immediately, no matter how long the TEARDOWN itself takes.
+		resp := Response{OK: true, State: d.overallStateLocked()}
+		done := d.teardownLocked(sink, session, client, capture)
+		d.mu.Unlock()
+
+		if !waitTeardowns([]<-chan struct{}{done}, disconnectTeardownWait) {
+			// Not an error for the caller: the stream is gone as far as the
+			// daemon's state is concerned, and the TEARDOWN keeps running in
+			// the background (Shutdown will still wait for it).
+			log.Printf("[daemon] teardown for %s still in flight after %v (continuing in background)", req.Target, disconnectTeardownWait)
 		}
-		if entry.session != nil {
-			entry.session.Close()
-		}
-		if entry.client != nil {
-			entry.client.Close()
-		}
-		return Response{OK: true, State: d.overallStateLocked()}
+		return resp
 	}
 
 	// Disconnect all.
-	d.stopAllLocked()
+	dones := d.stopAllLocked()
+	d.mu.Unlock()
+	if !waitTeardowns(dones, disconnectTeardownWait) {
+		log.Printf("[daemon] teardown of all streams still in flight after %v (continuing in background)", disconnectTeardownWait)
+	}
 	return Response{OK: true, State: StateIdle}
 }
 
@@ -1447,7 +1667,12 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 
 	sessions := make([]*airplay.MirrorSession, 0, len(targets))
 	for _, t := range targets {
-		if t.session != nil && (d.cfg.NoAudio || t.session.HasAudio()) {
+		// Same rule as status reporting: only streams that actually carry
+		// audio can be muted. This condition used to be inverted
+		// (`d.cfg.NoAudio || ...`), so with -no-audio the daemon still sent
+		// SET_PARAMETER volume to the receiver and recorded a mute state
+		// the GUI then displayed for audio that was never flowing.
+		if d.streamHasAudio(t) {
 			sessions = append(sessions, t.session)
 		}
 	}
@@ -1467,30 +1692,34 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 
 	d.mu.Lock()
 	for _, t := range targets {
-		t.audioMuted = muted
+		// d.mu was released for the RTSP round trips above, so a concurrent
+		// disconnect may have removed this stream in the meantime. Mutating
+		// the orphaned activeStream would be invisible but makes the
+		// response report a mute state for a stream that no longer exists.
+		if d.streams[t.deviceIP] == t {
+			t.audioMuted = muted
+		}
 	}
 	defer d.mu.Unlock()
 	return d.statusResponseLocked(true, "")
 }
 
-// stopAllLocked stops all active streams and tears down the capture.
+// stopAllLocked stops all active streams and detaches the capture.
 // Must be called with d.mu held.
-func (d *Daemon) stopAllLocked() {
+//
+// Returns one channel per started teardown; the caller should wait on them
+// (bounded) AFTER releasing d.mu. The teardowns run concurrently, so N dead
+// receivers cost one timeout, not N.
+func (d *Daemon) stopAllLocked() []<-chan struct{} {
 	d.pendingTarget = ""
+	d.audioOwner = ""
+	var dones []<-chan struct{}
 	for target, entry := range d.streams {
 		if entry.cancelFn != nil {
 			entry.cancelFn()
 		}
-		if entry.sink != nil {
-			entry.sink.Close()
-		}
-		if entry.session != nil {
-			entry.session.Close()
-		}
-		if entry.client != nil {
-			entry.client.Close()
-		}
 		delete(d.streams, target)
+		dones = append(dones, d.teardownLocked(entry.sink, entry.session, entry.client, nil))
 	}
 	// Mark this teardown as expected, and cancel the capture's context,
 	// before actually stopping it — see the captureStopExpected field doc.
@@ -1508,10 +1737,14 @@ func (d *Daemon) stopAllLocked() {
 		d.captureCancel = nil
 	}
 	if d.capture != nil {
-		d.capture.Stop()
+		// Stopping the capture blocks (up to 2s, unbounded in the kill
+		// fallback), so it goes into a teardown goroutine like everything
+		// else that waits — see the teardownWG field doc.
+		dones = append(dones, d.teardownLocked(nil, nil, nil, d.capture))
 		d.capture = nil
 	}
 	d.broadcast = nil
+	return dones
 }
 
 func toDeviceInfos(devices []airplay.AirPlayDevice) []DeviceInfo {

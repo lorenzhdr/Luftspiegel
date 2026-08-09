@@ -277,9 +277,19 @@ func (s *tcpPCMSource) acceptLoop(ctx context.Context) {
 }
 
 // readLoop relays one connection's PCM into the bounded buffer, resampling
-// from the contractual 48kHz input to the 44.1kHz ALAC expects, until the
-// connection errors (including being closed by acceptLoop on replacement, or
-// by Close on shutdown) or the peer disconnects.
+// from the contractual 44.1kHz input to the 44.1kHz ALAC expects (a
+// pass-through in practice — see pcmInputRate/pcmOutputRate — kept only so a
+// future 48kHz-only sender would work unchanged), until the connection errors
+// (including being closed by acceptLoop on replacement, or by Close on
+// shutdown) or the peer disconnects.
+//
+// acceptLoop can swap s.conn to a new connection while this goroutine is
+// still mid-Read on the old one: a chunk that was already received by the OS
+// before old.Close() took effect would otherwise reach appendPCM after the
+// new connection's readLoop has started appending, interleaving PCM from two
+// sources into one buffer. Re-checking s.conn == conn under connMu right
+// before the append closes that window: once acceptLoop has replaced s.conn,
+// this goroutine's remaining reads are silently dropped instead of mixed in.
 func (s *tcpPCMSource) readLoop(conn net.Conn) {
 	resampler := newLinearResampler(pcmInputRate, pcmOutputRate)
 	readBuf := make([]byte, 4096)
@@ -295,7 +305,12 @@ func (s *tcpPCMSource) readLoop(conn net.Conn) {
 			}
 			usable := len(data) - (len(data) % pcmBytesPerFrame)
 			if usable > 0 {
-				s.appendPCM(resampler.resample(data[:usable]))
+				s.connMu.Lock()
+				current := s.conn == conn
+				s.connMu.Unlock()
+				if current {
+					s.appendPCM(resampler.resample(data[:usable]))
+				}
 			}
 			if usable < len(data) {
 				pending = append([]byte(nil), data[usable:]...)
@@ -495,8 +510,10 @@ func (s *sineWaveSource) Close() error { return nil }
 // is not a high-fidelity resampler (no anti-aliasing filter) — doubletake is
 // a screen-mirroring sender, not an audio tool, and pulling in a proper
 // resampling library would be the first cgo dependency in a cgo-free build.
-// It is adequate for the ~9% rate change between the GUI's 48kHz WASAPI
-// capture and AirPlay's fixed 44.1kHz mirrored-audio format.
+// It is a pass-through today, since pcmInputRate/pcmOutputRate are both
+// 44100 (the GUI asks its AudioContext for 44.1kHz directly, see
+// pcmInputRate above) — but it stays adequate for the ~9% rate change a
+// future sender that could only capture WASAPI's native 48kHz would need.
 type linearResampler struct {
 	inRate, outRate int
 	pos             float64 // fractional position; integer part already consumed

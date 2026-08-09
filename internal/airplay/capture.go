@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 )
 
@@ -97,12 +98,12 @@ func ValidateRateControl(rateControl string) error {
 // timestamp side-channel — see mirror.go for how those are derived from the
 // stream itself).
 type ScreenCapture struct {
-	cmd     *exec.Cmd // capture process (gst-launch-1.0 on Linux, ffmpeg on Windows); nil for the stub backend
-	stdout  io.ReadCloser
-	cancel  context.CancelFunc
-	waitCh  chan struct{} // closed when the capture is done (process exited, or stub goroutine returned)
-	waitErr error         // set before waitCh is closed
-	stopped bool
+	cmd      *exec.Cmd // capture process (gst-launch-1.0 on Linux, ffmpeg on Windows); nil for the stub backend
+	stdout   io.ReadCloser
+	cancel   context.CancelFunc
+	waitCh   chan struct{} // closed when the capture is done (process exited, or stub goroutine returned)
+	waitErr  error         // set before waitCh is closed
+	stopOnce sync.Once
 
 	// extraClose, if set, runs during Stop() for platform-specific cleanup that
 	// isn't covered by cancel/stdout/cmd — e.g. closing the Wayland portal's
@@ -142,36 +143,40 @@ func (sc *ScreenCapture) Read(buf []byte) (int, error) {
 	return sc.stdout.Read(buf)
 }
 
+// Stop is safe to call concurrently and more than once (cmd/doubletake/main.go
+// does both: a deferred Stop() and a <-ctx.Done() goroutine that also calls
+// it). sync.Once makes the body run exactly once; callers that lose the race
+// return immediately without waiting for the first call to finish — that
+// matches the previous stopped-bool behavior and is intentional here, unlike
+// a typical Once-guarded teardown.
 func (sc *ScreenCapture) Stop() {
-	if sc.stopped {
-		return
-	}
-	sc.stopped = true
-	if sc.cancel != nil {
-		sc.cancel()
-	}
-
-	// Close stdout to unblock any pending Read() call.
-	if sc.stdout != nil {
-		sc.stdout.Close()
-	}
-
-	if sc.extraClose != nil {
-		sc.extraClose()
-	}
-
-	if sc.cmd != nil && sc.cmd.Process != nil {
-		_ = sc.cmd.Process.Signal(os.Interrupt)
-	}
-
-	select {
-	case <-sc.waitCh:
-	case <-time.After(2 * time.Second):
-		if sc.cmd != nil && sc.cmd.Process != nil {
-			_ = sc.cmd.Process.Kill()
+	sc.stopOnce.Do(func() {
+		if sc.cancel != nil {
+			sc.cancel()
 		}
-		<-sc.waitCh
-	}
+
+		// Close stdout to unblock any pending Read() call.
+		if sc.stdout != nil {
+			sc.stdout.Close()
+		}
+
+		if sc.extraClose != nil {
+			sc.extraClose()
+		}
+
+		if sc.cmd != nil && sc.cmd.Process != nil {
+			_ = sc.cmd.Process.Signal(os.Interrupt)
+		}
+
+		select {
+		case <-sc.waitCh:
+		case <-time.After(2 * time.Second):
+			if sc.cmd != nil && sc.cmd.Process != nil {
+				_ = sc.cmd.Process.Kill()
+			}
+			<-sc.waitCh
+		}
+	})
 }
 
 // logStderr relays a capture process's stderr to the debug log line by line.

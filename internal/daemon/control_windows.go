@@ -5,8 +5,10 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -33,11 +35,45 @@ func normalizeControlAddr(addr string) string {
 	if port, err := strconv.Atoi(addr); err == nil {
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	}
-	if _, _, err := net.SplitHostPort(addr); err == nil {
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		// Force loopback. The control channel has no authentication
+		// whatsoever (see handleRequest), so binding it to a wildcard or a
+		// LAN address would let anyone on the network connect/disconnect
+		// streams and mirror this screen. "-socket :7654" and
+		// "-socket 0.0.0.0:7654" used to do exactly that, despite the
+		// promise in this function's own doc comment.
+		if !isLoopbackHost(host) {
+			log.Printf("[daemon] control address %q is not loopback; the control channel is unauthenticated and has been restricted to 127.0.0.1:%s", addr, port)
+			return net.JoinHostPort("127.0.0.1", port)
+		}
 		return addr
 	}
 	// A bare host without a port; append the default port.
+	if !isLoopbackHost(addr) {
+		log.Printf("[daemon] control host %q is not loopback; the control channel is unauthenticated and has been restricted to 127.0.0.1", addr)
+		return defaultControlAddr()
+	}
 	return net.JoinHostPort(addr, strconv.Itoa(defaultControlPort))
+}
+
+// isLoopbackHost reports whether host is safe to bind the unauthenticated
+// control channel to.
+//
+// An empty host means the wildcard address (":7654" binds all interfaces),
+// which is explicitly not loopback. Anything that isn't a literal loopback IP
+// or "localhost" is treated as unsafe — including names this process cannot
+// resolve, so an unresolvable host can never fail open.
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // listenControl opens the control channel listener. addr may be a bare port,

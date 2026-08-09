@@ -902,6 +902,18 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 				s.videoWidth, s.videoHeight = w, h
 			}
 			avcC := buildAVCCConfig(latestSPS, latestPPS)
+			if avcC == nil {
+				// Should be unreachable now that handleNAL refuses to adopt an
+				// SPS/PPS short enough for buildAVCCConfig to reject — but guard
+				// anyway: a frame sent without a codec header is undecodable, so
+				// drop this access unit rather than sending garbage.
+				dbg("[STREAM] dropping access unit: buildAVCCConfig rejected latestSPS/latestPPS")
+				vclBuf = vclBuf[:0]
+				nalLog.Reset()
+				pendingKeyframe = false
+				auArrivalAt = time.Time{}
+				return nil
+			}
 			if frameCount < 20 {
 				dbg("[STREAM] sending codec frame avcC len=%d hdr=%02x", len(avcC), avcC[:min(8, len(avcC))])
 			}
@@ -984,9 +996,17 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			if err := flushVCL(); err != nil {
 				return err
 			}
-			latestSPS = raw
+			// A truncated/misdelimited SPS (fewer than the 4 bytes buildAVCCConfig
+			// reads for profile/level) is not adopted: keeping the previous
+			// (possibly nil) latestSPS just delays the next codec frame instead of
+			// baking a bad SPS into the avcC sent to the receiver.
+			if len(raw) >= 4 {
+				latestSPS = raw
+			}
 		case 8: // PPS
-			latestPPS = raw
+			if len(raw) >= 1 {
+				latestPPS = raw
+			}
 		case 6: // SEI — skip, don't include in VCL data
 		case 5: // IDR VCL slice — accumulate (may be multi-slice)
 			// If IDR appears while non-IDR data is buffered, close previous AU first.
@@ -1314,7 +1334,7 @@ func findStartCode(b []byte, from int) int {
 	if from < 0 {
 		from = 0
 	}
-	for i := from; i+3 < len(b); i++ {
+	for i := from; i+2 < len(b); i++ {
 		if b[i] == 0x00 && b[i+1] == 0x00 {
 			if b[i+2] == 0x01 {
 				return i
@@ -1517,7 +1537,15 @@ func spsDimensions(sps []byte) (width, height int, ok bool) {
 
 // buildAVCCConfig builds an AVCDecoderConfigurationRecord (avcC) from raw SPS and PPS.
 // Includes 4-byte trailer (02 00 00 00) observed in iPhone captures.
+// Returns nil if sps is too short to contain the profile/level bytes an avcC
+// header requires (sps[1:4]) — a truncated or misdelimited NAL (see
+// findStartCode) must not reach the unchecked indexing below. handleNAL also
+// refuses to adopt an SPS/PPS that short in the first place, so in practice
+// this is a second line of defense, not the primary guard.
 func buildAVCCConfig(sps, pps []byte) []byte {
+	if len(sps) < 4 || len(pps) < 1 {
+		return nil
+	}
 	avcCLen := 6 + 2 + len(sps) + 1 + 2 + len(pps)
 	payload := make([]byte, avcCLen+4) // +4 for trailer
 	payload[0] = 0x01                  // configurationVersion = 1

@@ -504,18 +504,33 @@ func runDaemon(cfg daemon.Config) {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// shutdownDone is closed once Shutdown has finished. Without it, nothing
+	// waits for it: cancel() makes Run return, runDaemon returns, main exits
+	// — and the process exit kills the RTSP TEARDOWN that Shutdown is still
+	// sending. An AirPlay receiver that never sees a TEARDOWN keeps the
+	// session pinned and refuses the next connection attempt.
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-sigCh
 		log.Println("[daemon] shutting down...")
 		cancel()
 		d.Shutdown()
+		close(shutdownDone)
+		// A second signal is the user's way out if a teardown hangs.
 		<-sigCh
 		log.Println("[daemon] forced exit")
 		os.Exit(1)
 	}()
 
-	if err := d.Run(ctx); err != nil {
-		log.Fatalf("[daemon] %v", err)
+	runErr := d.Run(ctx)
+	if ctx.Err() != nil {
+		// Run returned because we cancelled: let Shutdown finish its
+		// teardowns before this function (and with it main) returns.
+		<-shutdownDone
+	}
+	if runErr != nil {
+		log.Fatalf("[daemon] %v", runErr)
 	}
 }
 

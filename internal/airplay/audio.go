@@ -102,12 +102,12 @@ func randomRTPTime(reader io.Reader) (uint32, error) {
 // ScreenCapture in capture.go is shared between capture_linux.go and
 // capture_windows.go.
 type AudioCapture struct {
-	cmd     *exec.Cmd     // capture process (gst-launch-1.0 on Linux); nil on Windows
-	pcmPipe io.ReadCloser // continuous PCM source (44.1kHz stereo S16LE)
-	cancel  context.CancelFunc
-	waitCh  chan struct{} // closed when capture is done (process exited, or ctx canceled)
-	waitErr error         // set before waitCh is closed
-	stopped bool
+	cmd      *exec.Cmd     // capture process (gst-launch-1.0 on Linux); nil on Windows
+	pcmPipe  io.ReadCloser // continuous PCM source (44.1kHz stereo S16LE)
+	cancel   context.CancelFunc
+	waitCh   chan struct{} // closed when capture is done (process exited, or ctx canceled)
+	waitErr  error         // set before waitCh is closed
+	stopOnce sync.Once
 
 	// extraStop, if set, runs during Stop() for backend-specific cleanup beyond
 	// cancel/pcmPipe.Close/cmd.Kill — e.g. closing the Windows TCP listener and
@@ -200,31 +200,32 @@ func (ac *AudioCapture) DrainStale() {
 	}
 }
 
+// Stop is safe to call concurrently and more than once — mirrors
+// ScreenCapture.Stop in capture.go, including the same intentional
+// non-waiting behavior for a caller that loses the sync.Once race.
 func (ac *AudioCapture) Stop() {
-	if ac.stopped {
-		return
-	}
-	ac.stopped = true
-	if ac.cancel != nil {
-		ac.cancel()
-	}
-	if ac.pcmPipe != nil {
-		ac.pcmPipe.Close()
-	}
-	if ac.extraStop != nil {
-		ac.extraStop()
-	}
-	if ac.cmd != nil && ac.cmd.Process != nil {
-		ac.cmd.Process.Kill()
-	}
-	select {
-	case <-ac.waitCh:
-	case <-time.After(2 * time.Second):
+	ac.stopOnce.Do(func() {
+		if ac.cancel != nil {
+			ac.cancel()
+		}
+		if ac.pcmPipe != nil {
+			ac.pcmPipe.Close()
+		}
+		if ac.extraStop != nil {
+			ac.extraStop()
+		}
 		if ac.cmd != nil && ac.cmd.Process != nil {
 			ac.cmd.Process.Kill()
 		}
-		<-ac.waitCh
-	}
+		select {
+		case <-ac.waitCh:
+		case <-time.After(2 * time.Second):
+			if ac.cmd != nil && ac.cmd.Process != nil {
+				ac.cmd.Process.Kill()
+			}
+			<-ac.waitCh
+		}
+	})
 }
 
 // encodeALACVerbatim produces a verbatim (uncompressed) ALAC frame from
