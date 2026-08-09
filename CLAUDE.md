@@ -52,10 +52,22 @@ Windows-Port relevante Targets:
 
 **Wichtig:** Die GUI erwartet die Sidecar-Binaries unter den Namen `bin/luftspiegel.exe` und
 `bin/ffmpeg.exe`/`bin/ffprobe.exe` (siehe `gui/main.js:resolveSidecarPath` und
-`gui/package.json:extraResources`), nicht `doubletake.exe`. Das Makefile baut aber `doubletake.exe`/
-`doubletake-ctl.exe`. Es gibt **keinen automatisierten Rename-Schritt** — im lokalen `bin/`-Ordner liegen
-`luftspiegel.exe` und `luftspiegel-ctl.exe` bereits umbenannt/kopiert, aber wie dieser Schritt reproduzierbar
-ausgeführt wird ist nicht im Repo dokumentiert (offener Punkt, siehe Abschnitt 5).
+`gui/package.json:extraResources`), nicht `doubletake.exe`. Dafür gibt es seit 2.0 eigene Make-Targets, die
+direkt unter dem erwarteten Namen bauen — kein manuelles Umbenennen mehr:
+
+| Target | Ergebnis |
+|---|---|
+| `make gui-binaries` | beide Sidecars, s. u. |
+| `make luftspiegel` | `bin/luftspiegel.exe` (aus `./cmd/doubletake`) |
+| `make luftspiegel-ctl` | `bin/luftspiegel-ctl.exe` (aus `./cmd/doubletake-ctl`) |
+
+`make` selbst gibt es unter Windows in der Regel nicht; das PowerShell-Äquivalent ist
+
+```powershell
+$env:PATH = "C:\Program Files\Go\bin;$env:PATH"; $env:CGO_ENABLED = "0"
+go build -o bin/luftspiegel.exe ./cmd/doubletake
+go build -o bin/luftspiegel-ctl.exe ./cmd/doubletake-ctl
+```
 
 **Eine laufende GUI sperrt `bin\luftspiegel.exe`** (Windows hält die Datei des laufenden Prozesses fest) —
 vor jedem `go build`, der diese Datei überschreiben soll, erst die GUI/den Sidecar-Prozess beenden, sonst
@@ -302,9 +314,7 @@ Daemon komplett weg (frühe Sessions liefern ein *kürzeres* Array), eine Null b
   falsche Rate, Kanalzahl oder Bittiefe zu erkennen. Sowohl `pcmInputRate` als auch `pcmOutputRate` sind in
   `audio_windows.go` fest auf `44100` gesetzt (die Electron-GUI fordert diese Rate direkt von ihrer
   `AudioContext` an); der eingebaute `linearResampler` ist bei gleichen Raten ein reines Durchreichen und
-  bleibt nur für einen künftigen Sender vorbereitet, der nur 48 kHz liefern könnte. **Achtung:** Die
-  Flag-Hilfe von `-audio-tcp` in `cmd/doubletake/main.go` beschreibt das Wire-Format noch fälschlich als
-  „48000 Hz“ — das ist ein veralteter Kommentar, der tatsächliche Vertrag (Code + Wire) ist 44100 Hz.
+  bleibt nur für einen künftigen Sender vorbereitet, der nur 48 kHz liefern könnte.
 
 ## 4. Architektur
 
@@ -419,33 +429,43 @@ Gemessen dauert ein TEARDOWN rund 0,75 s.
 
 ### Verifizierter Stand
 
-Gegen das echte Apple TV (`AppleTV11,1`) getestet: Pairing, FairPlay, Live-Mirroring, Reconnect,
-Fenster-Schließen bei aktivem Stream, Audio.
+Gegen das echte Apple TV (`AppleTV11,1`, `192.168.178.125`) getestet: Pairing, FairPlay,
+Live-Mirroring, Reconnect, Fenster-Schließen bei aktivem Stream, Audio.
+
+Zuletzt bestätigt am **2026-08-10** mit den 2.0-Binaries (CLI-Pfad, ohne GUI):
+
+- Connect → `streaming` in ~5 s, 30 fps, `h264_mf`/`display_remoting`.
+- `au hold` p50 **9,7–10,1 ms**, p95 ~12 ms (Idle-Flush wirkt, s. Abschnitt 3).
+- `rtt` ~15 ms, `receiver latency` 27 ms, `target_latency_ms` 100 (nicht überschrieben).
+- `disconnect` **~0,66 s**, danach `idle`; der anschließende **Reconnect wird angenommen** — das ist der
+  eigentliche Beweis, dass das RTSP-TEARDOWN sauber durchlief.
+- `status`-Abfragen während eines laufenden Teardowns antworteten in **12–30 ms** (vor dem 2.0-Fix hielt
+  der Teardown `d.mu` und blockierte den Steuerkanal).
+- Keine verwaisten `luftspiegel.exe`- oder `ffmpeg.exe`-Prozesse nach dem Beenden.
+
+**Nicht** gegen echte Hardware verifiziert ist der Fall „Empfänger verschwindet mitten im Stream" (dafür
+müsste das Apple TV im Betrieb vom Netz) — dieser Pfad ist nur durch
+`TestHandleDisconnectReleasesLockDuringTeardown` abgedeckt.
 
 ## 5. Offene Punkte
 
-- **Rename-Schritt Daemon-Binaries nicht automatisiert.** Die GUI erwartet `bin/luftspiegel.exe` (und
-  `bin/luftspiegel-ctl.exe` für `doubletake-ctl`), der Go-Build erzeugt aber `doubletake.exe`/
-  `doubletake-ctl.exe`. Lokal liegen bereits umbenannte Kopien in `bin/`, aber weder Makefile noch ein
-  Skript im Repo bilden diesen Schritt nach — sollte geklärt/automatisiert werden (Makefile-Target oder
-  Build-Skript).
 - **`restrictOwnAudio` ungefixt.** Die App soll ihre eigenen Sounds nicht mitübertragen; die entsprechende
   Electron-API ist laut Code-Kommentar erst in Electron **v44** verfügbar, gepinnt ist aber **v42**
   (`gui/package.json`). Bewusst in Kauf genommen, bis auf eine neuere Electron-Version aktualisiert wird.
-- **Installer-Build nicht abschließend abgenommen.** `npm run build` (`electron-builder --win --arm64`,
-  NSIS) wurde noch nicht vollständig verifiziert.
 - **Praktische Bedienabnahme der GUI durch den Nutzer steht aus** (über die Low-Level-Verifikation von
   Pairing/Mirroring/Audio hinaus).
-- **Die Latenz-Optimierungen sind noch nicht gegen echte Hardware gemessen.** Idle-Flush, `-flush_packets`,
-  GOP-Default 4 s und der Audio-Drain sind implementiert und durch Unit-Tests abgesichert, aber der A/B-
-  Vergleich gegen das Apple TV steht aus (Gerät war beim Bau nicht erreichbar). Vorgehen: Baseline mit
-  `doubletake-ctl stats` aufnehmen (`au hold` erwartet ~33 ms vor, ~8–12 ms nach dem Idle-Flush), dann die
-  Änderungen einzeln umschalten. Die echte Ende-zu-Ende-Latenz braucht zusätzlich eine Handmessung
-  (Millisekunden-Stoppuhr im Vollbild, Foto von Laptop und TV nebeneinander) — die Instrumentierung misst
-  nur bis zum Socket bzw. das, was der Receiver über sich selbst meldet.
-- **Ob `-target-latency-ms` überhaupt wirkt, ist ungeprüft.** Der `Audio-Latency`-Header der RECORD-Antwort
-  überschreibt den Wert (`mirror.go`). Ein `-debug`-Lauf gegen das echte Gerät klärt, ob der Regler in der
-  GUI echt oder kosmetisch ist; die Statistik zeigt unter `target_latency_ms` den tatsächlich wirksamen Wert.
+- **Ende-zu-Ende-Latenz ist weiterhin nur bis zum Socket gemessen.** Der Idle-Flush ist gegen echte
+  Hardware bestätigt (2026-08-10, `AppleTV11,1`: `au hold` p50 **9,7–10,1 ms**, p95 ~12 ms — vorher lag
+  ein voller Frame-Hold von ~33 ms an), ebenso `rtt` (~15 ms) und die vom Receiver gemeldete
+  `receiver latency` (27 ms). Was **nicht** gemessen ist, ist die echte Ende-zu-Ende-Latenz: dafür braucht
+  es eine Handmessung (Millisekunden-Stoppuhr im Vollbild, Foto von Laptop und TV nebeneinander), denn die
+  Instrumentierung endet am Socket bzw. an dem, was der Receiver über sich selbst behauptet. Ein A/B gegen
+  `-flush_packets`/GOP-Default steht ebenfalls noch aus — gemessen wurde nur der Ist-Zustand.
+- **`-target-latency-ms` wirkt zumindest auf diesem Gerät.** Im Lauf vom 2026-08-10 meldete die Statistik
+  `target_latency_ms: 100`, also den konfigurierten Wert — der `Audio-Latency`-Header der RECORD-Antwort
+  hat ihn hier nicht überschrieben und die 500-ms-Untergrenze für Receiver ohne FairPlay-SAP griff nicht.
+  Ob ein anderer Receiver den Wert überschreibt, ist damit nicht ausgeschlossen; `target_latency_ms` in der
+  Statistik bleibt die Stelle, an der man den tatsächlich wirksamen Wert abliest.
 - **`-race` ist auf windows/arm64 nicht verfügbar.** Die Nebenläufigkeit im neuen Statistik-Subsystem und im
   Reader-Goroutine-Umbau ist dadurch lokal nicht mit dem Race-Detector geprüft — ein Linux-CI-Lauf wäre der
   natürliche Ort dafür (siehe auch den fehlenden Windows-CI-Punkt unten).
@@ -455,9 +475,7 @@ Fenster-Schließen bei aktivem Stream, Audio.
   `AudioCapture` sind plattformunabhängige Contracts, siehe `capture.go`/`audio.go`).
 - **Lizenz: LGPL-3.0-or-later ist zwingend** (abgeleitetes Werk von `doubletake`), eine Relizenzierung ist
   nicht erlaubt; die Herkunft (Fork von `omarroth/doubletake`) muss erkennbar bleiben. `gui/package.json`
-  gab zum Zeitpunkt dieser Dokumentation im committeten Stand fälschlich `"license": "GPL-3.0"` an — im
-  Arbeitsverzeichnis liegt (uncommitted) bereits eine Korrektur auf `"LGPL-3.0-or-later"` vor; sollte
-  committet werden.
+  steht seit dem 2.0-Release korrekt auf `"LGPL-3.0-or-later"` (vorher fälschlich `"GPL-3.0"`).
 - **Zusätzliche Remote `origin/gpl-only`** existiert (`git branch -a`) — Zweck/Inhalt nicht aus dem Code
   ersichtlich, ggf. beim nächsten Aufräumen klären.
 - **Kein automatisierter Windows-CI-Lauf.** `.github/workflows/ci.yml` baut/testet ausschließlich auf

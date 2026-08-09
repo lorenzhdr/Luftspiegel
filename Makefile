@@ -1,4 +1,4 @@
-.PHONY: all build doubletake doubletake-ctl doubletake-release doubletake-ctl-release manpages-release install install-man uninstall test clean
+.PHONY: all build doubletake doubletake-ctl doubletake-release doubletake-ctl-release manpages-release install install-man uninstall test clean luftspiegel luftspiegel-ctl gui-binaries
 
 PREFIX ?= /usr/local
 MANDIR ?= $(PREFIX)/share/man
@@ -12,6 +12,26 @@ doubletake:
 
 doubletake-ctl:
 	go build -o bin/doubletake-ctl ./cmd/doubletake-ctl
+
+# --- Windows-Port: Sidecar-Binaries für die Electron-GUI -------------------
+#
+# Die GUI sucht die Sidecars unter bin/luftspiegel.exe bzw.
+# bin/luftspiegel-ctl.exe (gui/main.js:resolveSidecarPath und
+# gui/package.json:extraResources), das Upstream-Makefile baut aber
+# doubletake(.exe). Bisher wurde von Hand umbenannt; diese Targets bauen
+# direkt unter dem erwarteten Namen, damit der Installer-Build reproduzierbar
+# ist.
+#
+# Unter Windows hängt Go das .exe selbst an. Wichtig: eine laufende GUI hält
+# bin\luftspiegel.exe exklusiv geöffnet — vor dem Build beenden, sonst
+# scheitert das Schreiben mit einem Zugriffsfehler.
+gui-binaries: luftspiegel luftspiegel-ctl
+
+luftspiegel:
+	CGO_ENABLED=0 go build -o bin/luftspiegel ./cmd/doubletake
+
+luftspiegel-ctl:
+	CGO_ENABLED=0 go build -o bin/luftspiegel-ctl ./cmd/doubletake-ctl
 
 doubletake-release:
 	CGO_ENABLED=0 go build -ldflags='-s -w -extldflags=-static' -o doubletake ./cmd/doubletake
